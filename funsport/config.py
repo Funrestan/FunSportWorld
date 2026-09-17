@@ -77,16 +77,51 @@ def clear_session():
 
 
 # ── 配置 ────────────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "username": "",
+    "password": "",
+    "remember": False,
+    "dist_min": 1.0,
+    "dist_max": 1.5,
+    "pace_min": 360,
+    "pace_max": 480,
+    "face_check": True,
+    "amap_key": "",            # 高德 Key（lbs-amap 写入）
+}
+
+
 def load_config() -> dict:
-    return load_json(CONFIG_FILE) or {
-        "username": "", "password": "", "remember": False,
-        "dist_min": 1.0, "dist_max": 1.5,
-        "pace_min": 360, "pace_max": 480,
-        "face_check": True,
-    }
+    cfg = load_json(CONFIG_FILE) or {}
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
 
 def save_config(c: dict):
     save_json(CONFIG_FILE, c)
+
+
+def get_amap_key() -> str:
+    """优先级：环境变量 FUNSPORT_AMAP_KEY > config.json > 空。"""
+    env = os.environ.get("FUNSPORT_AMAP_KEY", "").strip()
+    if env:
+        return env
+    cfg = load_config()
+    return (cfg.get("amap_key") or "").strip()
+
+
+def set_amap_key(key: str):
+    cfg = load_config()
+    cfg["amap_key"] = key
+    save_config(cfg)
+
+
+def clear_loop_cache():
+    """删除环缓存（下次 --use-map 强制重新生成）。"""
+    p = DATA_DIR / "campus_loop_bd.json"
+    if p.exists():
+        p.unlink()
+        return True
+    return False
 
 
 # ── 缓存 ────────────────────────────────────────────────────

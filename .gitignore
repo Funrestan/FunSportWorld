@@ -18,6 +18,7 @@ dist/
 *.egg
 wheels/
 pip-wheel-metadata/
+test/
 
 # ── 测试/覆盖率 ───────────────────────────────────────────
 .pytest_cache/

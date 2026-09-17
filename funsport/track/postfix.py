@@ -1,6 +1,5 @@
 """轨迹后处理。"""
-from .geom import round_to, fmt_gain_time
-from .generator import SPEED_FLOOR, SPEED_CEIL
+from .geom import round_to, fmt_gain_time, SPEED_FLOOR, SPEED_CEIL
 
 
 def apply_post_fixes(locs, rng, start_ms):

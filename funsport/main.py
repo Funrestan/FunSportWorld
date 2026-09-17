@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from .logger import log, ok, err, warn, info
 from .config import (load_identity, load_session, save_session, clear_session,
-                     load_config, save_config)
+                     load_config, save_config, set_amap_key, clear_loop_cache)
 from .api.client import ApiClient
 
 
@@ -57,11 +57,27 @@ def cmd_points(args):
                  f"BD=({p.get('lat')},{p.get('lon')})")
 
 
+def cmd_lbs_amap(args):
+    set_amap_key(args.key)
+    ok(f"高德 Key 已写入 config.json：{args.key[:8]}…")
+
+
+def cmd_loop_rebuild(args):
+    from .api import points as api_points
+    from .api import campus_loop as api_loop
+    client = make_client()
+    clear_loop_cache()
+    pts = api_points.fetch_points(client)
+    ring = api_loop.get_campus_loop(pts, force_rebuild=True)
+    ok(f"环已重建：{len(ring)} 点 → .funsport/campus_loop_bd.json")
+
+
 def cmd_run(args):
     from .api import flow
     client = make_client()
     dist = args.dist * 1000
     dur = int(dist / 1000 * args.pace)
+
     if args.time:
         h, m = args.time.split(":")
         base = datetime.now() - timedelta(days=args.days_ago)
@@ -73,10 +89,13 @@ def cmd_run(args):
     else:
         start_ms = int(time.time() * 1000) - random.randint(30, 300) * 60_000
 
-    log.info(f"参数：{dist:.0f}m / {dur}s / 配速 {args.pace}s/km / 开始 {fmt_hms(start_ms)}")
+    tag = " / 真实路径（高德环）" if args.use_map else ""
+    log.info(f"参数：{dist:.0f}m / {dur}s / 配速 {args.pace}s/km / 开始 {fmt_hms(start_ms)}{tag}")
+
     result = flow.run_full_flow(client, dist, dur, start_ms,
                                 face_check=1 if args.face else 0,
-                                seed=args.seed)
+                                seed=args.seed,
+                                use_map=args.use_map)
     print()
     ok(f"跑步成功 rrid={result['rrid']} uuid={result['uuid']}")
     ok(f"OBS {result['obs_ok']}/2 · 验证 {'通过' if result['detail_ok'] else '未通过'}")
@@ -196,6 +215,13 @@ def main():
     sp = sub.add_parser("points", help="查看整组打卡点")
     sp.set_defaults(func=cmd_points)
 
+    sp = sub.add_parser("lbs-amap", help="配置高德 LBS Key（写入 config.json）")
+    sp.add_argument("--key", required=True, help="高德 Web 服务 Key")
+    sp.set_defaults(func=cmd_lbs_amap)
+
+    sp = sub.add_parser("loop-rebuild", help="强制重建校园环（高德）")
+    sp.set_defaults(func=cmd_loop_rebuild)
+
     sp = sub.add_parser("run", help="跑步全链")
     sp.add_argument("--dist", type=float, default=1.2, help="距离 km")
     sp.add_argument("--pace", type=float, default=400, help="配速 秒/km")
@@ -204,6 +230,8 @@ def main():
     sp.add_argument("--time", help="HH:MM")
     sp.add_argument("--face", action="store_true", default=True)
     sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--use-map", action="store_true",
+                    help="用高德生成的校园环替代拟合环")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("ai-list", help="AI 项目列表")

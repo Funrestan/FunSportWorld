@@ -2,11 +2,9 @@
 import math
 
 from .geom import (round_to, Rng, make_point_ring, ring_point_at, to_bd,
-                   MET_PER_DEG_LAT, MET_PER_DEG_LNG, fmt_gain_time)
+                   MET_PER_DEG_LAT, MET_PER_DEG_LNG, fmt_gain_time,
+                   SPEED_FLOOR, SPEED_CEIL)
 from ..logger import log, ok, dim
-
-SPEED_FLOOR = 1.90
-SPEED_CEIL = 6.30
 
 
 def fit_speeds(w, dts, target):
@@ -21,36 +19,60 @@ def fit_speeds(w, dts, target):
         w[i] = min(max(w[i], SPEED_FLOOR), SPEED_CEIL)
 
 
-def build(dist, dur, seed, start_ms, points_bd):
-    rng = Rng(seed)
-    log.info(f"[track] 生成 {dist:.0f}m / {dur}s seed={seed} 点位={len(points_bd)}")
+def _make_dips(rng, dur):
+    dips = []
+    for _ in range(rng.choice([1, 1, 2])):
+        dips.append((rng.uniform(0.15, 0.75) * dur,
+                     rng.uniform(25, 55), rng.uniform(0.08, 0.16)))
+    return dips
 
-    dense, arcs, (c_lat, c_lng) = make_point_ring(points_bd)
-    direction = rng.choice([1.0, -1.0])
-    s0 = rng.uniform(0, arcs[-1] if arcs else 400)
+
+def _dip_factor(tt, dips):
+    f = 1.0
+    for c, hw, d in dips:
+        if abs(tt - c) < hw:
+            f *= 1.0 - d * 0.5 * (1 + math.cos(math.pi * (tt - c) / hw))
+    return f
+
+
+def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
+    rng = Rng(seed)
+    log.info(f"[track] 生成 {dist:.0f}m / {dur}s seed={seed} "
+             f"点位={len(points_bd)} 模式={'真实路径' if ordered_path else '拟合环'}")
+
+    dense, arcs, (c_lat, c_lng) = make_point_ring(points_bd, ordered=ordered_path)
+    ring_len = arcs[-1] if arcs else 0.0
+
+    if ordered_path:
+        # 真实路径：固定方向、从起点出发；只跑 dist 米（弧长在 dist 处停）
+        direction = 1.0
+        s0 = 0.0
+        s_limit = dist
+        jitter_sigma = 0.40
+        jitter_ar = 0.55
+        log.info(f"[track] 环长 {ring_len:.0f}m，只跑前 {dist:.0f}m")
+    else:
+        direction = rng.choice([1.0, -1.0])
+        s0 = rng.uniform(0, ring_len)
+        s_limit = float("inf")
+        jitter_sigma = 0.75
+        jitter_ar = 0.72
+
     phase_v = rng.uniform(0, math.tau)
     phase_l = rng.uniform(0, math.tau)
 
+    # 时间采样
     times = []
     t = 0.0
     while t < dur:
         times.append(t)
         t += 5.0 if rng.random() < 0.80 else rng.choice([1, 2, 3, 4, 6, 7, 8])
-    n = len(times)
+    n_max = len(times)
 
-    dips = []
-    for _ in range(rng.choice([1, 1, 2])):
-        dips.append((rng.uniform(0.15, 0.75) * dur,
-                     rng.uniform(25, 55), rng.uniform(0.08, 0.16)))
-
-    def dip_factor(tt):
-        f = 1.0
-        for c, hw, d in dips:
-            if abs(tt - c) < hw:
-                f *= 1.0 - d * 0.5 * (1 + math.cos(math.pi * (tt - c) / hw))
-        return f
-
+    dips = _make_dips(rng, dur)
     base = dist / dur
+
+    # 速度曲线（时间维度）
     w = []
     for tt in times:
         ramp = 1.0
@@ -63,18 +85,18 @@ def build(dist, dur, seed, start_ms, points_bd):
         wave = (1.0
                 + 0.010 * math.sin(math.tau * tt / 115.0 + phase_v)
                 + 0.035 * math.sin(math.tau * tt / 47.0 + phase_v * 2.3)
-                + 0.015 * math.sin(math.tau * tt / 19.0 + phase_v * 3.7)) * dip_factor(tt)
+                + 0.015 * math.sin(math.tau * tt / 19.0 + phase_v * 3.7)) * _dip_factor(tt, dips)
         noise = 1.0 + rng.gauss(0, 0.008)
         w.append(base * ramp * fatigue * wave * noise)
 
-    dts = [times[i + 1] - times[i] for i in range(n - 1)]
+    dts = [times[i + 1] - times[i] for i in range(n_max - 1)]
     dts.append(max(1.0, dur - times[-1]))
     fit_speeds(w, dts, dist)
-    seg_dist = [w[i] * dts[i] for i in range(n)]
-    dim(f"速度拟合：{n} 点 平均 {dist/dur:.2f} m/s")
+    dim(f"速度拟合：{n_max} 点 平均 {dist/dur:.2f} m/s")
 
+    # 点位类型分布
     kinds = []
-    for _ in range(n):
+    for _ in range(n_max):
         u = rng.random()
         if u < 0.39:
             kinds.append((3, 1))
@@ -86,16 +108,11 @@ def build(dist, dur, seed, start_ms, points_bd):
                                        ((-1, 6), 2)]))
         else:
             kinds.append((rng.choice([1, 1, 1, 1, 2, 2]), 1))
-    for i in range(1, n):
+    for i in range(1, n_max):
         if kinds[i][0] == -1 and kinds[i - 1][0] == -1:
             kinds[i] = (rng.choice([3, 0]), 1)
 
-    normal_idx = [i for i in range(n) if kinds[i][0] != -1 and i > 1]
-    share = sum(seg_dist[i] for i in normal_idx) or 1.0
-    disp_of = [0.0] * n
-    for i in normal_idx:
-        disp_of[i] = seg_dist[i] * (dist / share)
-
+    # 主循环
     locs = []
     s = s0
     t_acc = dist_acc = steps_acc = 0.0
@@ -104,17 +121,19 @@ def build(dist, dur, seed, start_ms, points_bd):
     n_est = max(1, int(dur / 5))
     alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est)
 
-    for i in range(n):
+    for i in range(n_max):
         dt = dts[i]
         typ, lt = kinds[i]
         t_acc += dt
         d_step = 0.0
         if typ != -1:
-            d_step = disp_of[i]
+            d_step = w[i] * dt
+            if ordered_path and (s - s0 + d_step) > s_limit:
+                d_step = max(0.0, s_limit - (s - s0))
             s += direction * d_step
             bx, by = ring_point_at(dense, arcs, s)
-            jx = 0.72 * jx + rng.gauss(0, 0.75)
-            jy = 0.72 * jy + rng.gauss(0, 0.75)
+            jx = jitter_ar * jx + rng.gauss(0, jitter_sigma)
+            jy = jitter_ar * jy + rng.gauss(0, jitter_sigma)
             px, py = bx + jx, by + jy
             dist_acc += d_step
         else:
@@ -128,16 +147,19 @@ def build(dist, dur, seed, start_ms, points_bd):
         alt += 0.04 * (82.0 - alt) + rng.gauss(0, alt_sigma)
 
         v_now = dist / dur
-        stride = 0.62 + 0.17 * v_now + 0.03 * math.sin(math.tau * t_acc / 200 + phase_l) + rng.gauss(0, 0.008)
+        stride = (0.62 + 0.17 * v_now
+                  + 0.03 * math.sin(math.tau * t_acc / 200 + phase_l)
+                  + rng.gauss(0, 0.008))
         v_cad = v_now * (1 + 0.03 * math.sin(math.tau * t_acc / 70 + phase_v))
         cad = min(max(v_cad / stride * 60, 100), 200)
         steps_acc += cad / 60 * dt
 
         if typ == -1:
             avg_sp = round_to(dist_acc / max(1, t_acc), 4)
-            gps = round_to(rng.uniform(15, 46) if rng.random() < 0.12 else rng.uniform(0.5, 6.0), 4)
+            gps = round_to(rng.uniform(15, 46) if rng.random() < 0.12
+                           else rng.uniform(0.5, 6.0), 4)
         else:
-            avg_sp = round_to(d_step / dt, 4)
+            avg_sp = round_to(d_step / dt, 4) if dt > 0 else 0.0
             kmh = avg_sp * 3.6
             sigma = max(kmh * 0.08, 0.05)
             gps = 0.0 if rng.random() < 0.20 else round_to(max(0, kmh + rng.gauss(0, sigma)), 4)
@@ -165,13 +187,19 @@ def build(dist, dur, seed, start_ms, points_bd):
             "bdS": round_to(max(avg_sp * rng.uniform(0.6, 0.95), 0.0), 3),
             "bdG": rng.choice([1, 1, 1, -1]),
             "count": rng.randint(20, 88), "dtr": 0.0,
-            "state": rng.weighted([(1, 145), (2, 256), (3, 151)]) if typ != 0 else rng.weighted([(1, 145), (2, 45), (3, 164)]),
+            "state": rng.weighted([(1, 145), (2, 256), (3, 151)]) if typ != 0
+                     else rng.weighted([(1, 145), (2, 45), (3, 164)]),
             "locationId": "",
         })
+
+        if ordered_path and (s - s0) >= s_limit - 0.5:
+            break
 
     from .postfix import apply_post_fixes
     apply_post_fixes(locs, rng, start_ms)
 
+    # 点位吸附：真实路径下半径收紧
+    snap_radius = 20.0 if ordered_path else 40.0
     for pl in points_bd:
         best_i, best_d = None, 1e18
         for i, q in enumerate(locs):
@@ -179,15 +207,16 @@ def build(dist, dur, seed, start_ms, points_bd):
                  ((q["gLng"] - pl[1]) * MET_PER_DEG_LNG) ** 2
             if dd < best_d:
                 best_d, best_i = dd, i
-        if best_i is not None and best_d < 40 * 40:
+        if best_i is not None and best_d < snap_radius * snap_radius:
             locs[best_i]["gLat"] = round_to(pl[0], 7)
             locs[best_i]["gLng"] = round_to(pl[1], 7)
 
+    # 10s 窗
     speed_win, steps_win = [], []
     ten_t = ten_d = ten_st = 0.0
-    for i in range(n):
-        ten_t += dts[i]
-        ten_d += w[i] * dts[i]
+    for i in range(len(locs)):
+        ten_t += dts[i] if i < len(dts) else 0.0
+        ten_d += w[i] * (dts[i] if i < len(dts) else 0.0)
         ten_st += (locs[i]["steps"] - (locs[i - 1]["steps"] if i else 0))
         while ten_t >= 10.0:
             k = 10.0 / ten_t
@@ -202,11 +231,13 @@ def build(dist, dur, seed, start_ms, points_bd):
         speed_win.append({"time": 10, "value": round_to(ten_d * k, 2)})
         steps_win.append({"time": 10, "value": round_to(ten_st * k, 0)})
 
+    total_dis_actual = dist_acc
+    total_t_actual = int(round(t_acc))
     track = {
-        "totalTime": int(round(t_acc)),
-        "totalDistance": round_to(dist, 3),
-        "validDistance": round_to(dist, 3),
-        "validTime": int(round(t_acc)),
+        "totalTime": total_t_actual,
+        "totalDistance": round_to(total_dis_actual, 3),
+        "validDistance": round_to(total_dis_actual, 3),
+        "validTime": total_t_actual,
         "startTime": start_ms,
         "startLatitude": locs[0]["gLat"] if locs else 0.0,
         "startLongitude": locs[0]["gLng"] if locs else 0.0,
