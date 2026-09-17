@@ -21,12 +21,16 @@ def main():
     sp.add_argument("--key", help="高德 LBS Key（可空）")
     sp.add_argument("--device", choices=["keep", "new"],
                     help="设备身份：keep=保留现有，new=随机生成")
+    sp.add_argument("--before-min", type=int, default=30,
+                    help="提交时间最短提前（分钟），默认 30")
+    sp.add_argument("--before-max", type=int, default=300,
+                    help="提交时间最长提前（分钟），默认 300")
     sp.set_defaults(func=init_cmd.cmd_init)
 
     # ── login / logout ──────────────────────────────────────
-    sp = sub.add_parser("login", help="登录")
-    sp.add_argument("--user", required=True)
-    sp.add_argument("--pass", dest="pass_", required=True)
+    sp = sub.add_parser("login", help="登录（无参数时从 config.json 读取账号）")
+    sp.add_argument("--user", help="手机号（可空，回退 config.json）")
+    sp.add_argument("--pass", dest="pass_", help="密码（可空，回退 config.json）")
     sp.add_argument("--remember", action="store_true")
     sp.set_defaults(func=cmds.cmd_login)
 
@@ -70,6 +74,10 @@ def main():
     sp.add_argument("--ago", type=int, default=0)
     sp.add_argument("--days-ago", type=int, default=0)
     sp.add_argument("--time")
+    sp.add_argument("--before", type=int, default=0,
+                    help="提交时间提前 N 分钟（覆盖 config；默认走 config 范围随机）")
+    sp.add_argument("--allow-outside", action="store_true",
+                    help="允许在有效时间窗口外提交（跳过校验）")
     sp.add_argument("--face", action="store_true", default=True)
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--use-map", action="store_true")

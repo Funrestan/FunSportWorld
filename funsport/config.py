@@ -111,7 +111,12 @@ DEFAULT_CONFIG = {
     "pace_max": 480,
     "face_check": True,
     "amap_key": "",
-    "city": "成都市",              # ← 新增：默认城市
+    "city": "成都市",
+
+    # ── 开始时间提前量（分钟）──
+    "start_before_min": 30,
+    "start_before_max": 300,
+
     # ── auto 模式参数 ──
     "auto_dist_extra_min": 0.10,
     "auto_dist_extra_max": 0.30,
@@ -155,6 +160,22 @@ def get_city() -> str:
         return c
     idn = load_identity()
     return (idn.get("city") or "成都市").strip()
+
+
+def get_start_before_range() -> tuple:
+    """返回 (min, max) 分钟。保证 min <= max，且都 >= 1。"""
+    cfg = load_config()
+    bmin = max(1, int(cfg.get("start_before_min", 30)))
+    bmax = max(bmin, int(cfg.get("start_before_max", 300)))
+    return bmin, bmax
+
+
+def set_start_before(minutes: int, max_minutes: int = None):
+    """设置提交时间提前量（分钟）。max 缺省 = min（固定）。"""
+    cfg = load_config()
+    cfg["start_before_min"] = int(minutes)
+    cfg["start_before_max"] = int(max_minutes if max_minutes is not None else minutes)
+    save_config(cfg)
 
 
 def clear_loop_cache():

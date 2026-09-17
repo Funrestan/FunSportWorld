@@ -3,6 +3,7 @@ import json
 import math
 import random
 import time
+from datetime import datetime, time as dtime
 
 from . import policy as api_policy
 from . import points as api_points
@@ -13,7 +14,7 @@ from . import campus_loop as api_loop
 from ..config import load_config
 from ..track import generator, wire
 from ..track.geom import MET_PER_DEG_LAT, MET_PER_DEG_LNG, SPEED_FLOOR, SPEED_CEIL
-from ..logger import log, ok, warn, step
+from ..logger import log, ok, warn, step, err
 
 
 def _ring_length(ring):
@@ -23,6 +24,45 @@ def _ring_length(ring):
         total += math.hypot((a[0] - b[0]) * MET_PER_DEG_LAT,
                             (a[1] - b[1]) * MET_PER_DEG_LNG)
     return total
+
+
+def _check_time_window(start_ms, dur, valid_time):
+    """检查 [start_ms, start_ms + dur*1000] 是否落在 valid_time 任一段内。
+
+    valid_time 格式：[{"start": "HH:MM:SS", "end": "HH:MM:SS"}, ...]
+    返回 (ok, reason)。
+    """
+    if not valid_time:
+        return True, "未配置时间窗口（跳过校验）"
+
+    start_dt = datetime.fromtimestamp(start_ms / 1000)
+    stop_dt = datetime.fromtimestamp((start_ms + dur * 1000) / 1000)
+    start_t = start_dt.time()
+    stop_t = stop_dt.time()
+    crosses_day = stop_dt.date() != start_dt.date()
+
+    windows_str = []
+    for w in valid_time:
+        try:
+            ws = dtime.fromisoformat(w["start"])
+            we = dtime.fromisoformat(w["end"])
+        except Exception:
+            continue
+        windows_str.append(f"{w['start']}~{w['end']}")
+        if not crosses_day:
+            # 同一天：整个区间必须落在 [ws, we] 内
+            if ws <= start_t and stop_t <= we:
+                return True, f"落在 {w['start']}~{w['end']} 窗口内"
+        else:
+            # 跨天：起点落在当天窗口内即可
+            if ws <= start_t <= we:
+                return True, f"跨天，起点在 {w['start']}~{w['end']} 窗口内"
+
+    return False, (
+        f"起点 {start_t.strftime('%H:%M:%S')} / "
+        f"终点 {stop_t.strftime('%H:%M:%S')} "
+        f"不在有效窗口 [{', '.join(windows_str)}]"
+    )
 
 
 def _resolve_params(dist, pace, cadence, auto, sel_dist,
@@ -101,12 +141,36 @@ def _resolve_params(dist, pace, cadence, auto, sel_dist,
     return dist_m, pace_s, cadence_spm
 
 
+def _resolve_start_ms(before, start_ms):
+    """解析最终 start_ms。优先级：--before > 上游传入 > config 范围随机。"""
+    if before and before > 0:
+        ms = int(time.time() * 1000) - before * 60_000
+        log.info(f"[time] --before 固定提前 {before} 分钟")
+    elif start_ms and start_ms > 0:
+        ms = start_ms
+        log.info(f"[time] 上游指定 start_ms={start_ms}")
+    else:
+        cfg = load_config()
+        bmin = max(1, int(cfg.get("start_before_min", 30)))
+        bmax = max(bmin, int(cfg.get("start_before_max", 300)))
+        if bmin == bmax:
+            ms = int(time.time() * 1000) - bmin * 60_000
+            log.info(f"[time] config 固定提前 {bmin} 分钟")
+        else:
+            before_min = random.randint(bmin, bmax)
+            ms = int(time.time() * 1000) - before_min * 60_000
+            log.info(f"[time] config 范围 {bmin}~{bmax} 分钟随机 → 提前 {before_min} 分钟")
+    ms += random.randint(0, 4) * 1000
+    return ms
+
+
 def run_full_flow(client, dist=0, pace=0, cadence=0, start_ms=0,
                   face_check=1, seed=0, use_map=False, auto=False,
                   dist_min=None, dist_max=None,
                   pace_min=None, pace_max=None,
                   cadence_min=None, cadence_max=None,
-                  min_dist=None):
+                  min_dist=None, before=None,
+                  allow_outside_window=False):
     log.info("═══ 跑步全链开始 ═══")
 
     step("[1/6] 拉取跑步策略…")
@@ -133,6 +197,27 @@ def run_full_flow(client, dist=0, pace=0, cadence=0, start_ms=0,
     dur = int(dist_m / 1000 * pace_s)
     log.info(f"最终参数：{dist_m:.0f}m / {dur}s / 配速 {pace_s:.0f}s/km "
              f"/ 步频 {cadence_spm:.0f}spm")
+
+    # ── 开始时间 ──
+    start_ms = _resolve_start_ms(before, start_ms)
+
+    # ── 时间窗口校验 ──
+    ok_win, reason = _check_time_window(start_ms, dur, pol.valid_time)
+    if not ok_win:
+        if allow_outside_window:
+            warn(f"⚠ 开始时间不在有效窗口：{reason}")
+            warn("--allow-outside 已启用，继续提交")
+        else:
+            start_dt_str = datetime.fromtimestamp(start_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            stop_dt_str = datetime.fromtimestamp((start_ms + dur * 1000) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            err(f"✗ 开始时间不在有效窗口：{reason}")
+            err(f"  开始：{start_dt_str}")
+            err(f"  结束：{stop_dt_str}")
+            err(f"  policy.valid_time={pol.valid_time}")
+            err(f"  提示：加 --allow-outside 强制提交")
+            raise RuntimeError(f"开始时间不在有效窗口：{reason}")
+    else:
+        log.info(f"[time] 窗口校验通过：{reason}")
 
     step("[2/6] 拉取实时点位（整组）…")
     pts = api_points.fetch_points(client)
@@ -162,8 +247,6 @@ def run_full_flow(client, dist=0, pace=0, cadence=0, start_ms=0,
     if abs(fixed_avg - avg) > 1e-6:
         dur = int(round(dist_m / fixed_avg))
         warn(f"配速越界，时长修正为 {dur}s")
-    start_ms = start_ms or (int(time.time() * 1000) - random.randint(30, 300) * 60_000)
-    start_ms += random.randint(0, 4) * 1000
 
     track = generator.build(dist_m, dur, seed, start_ms, pts_bd,
                             ordered_path=use_map,

@@ -3,11 +3,13 @@ import sys
 import time
 import uuid
 import random
+from datetime import datetime, time as dtime
 
 from ..api.client import ApiClient
 from ..api import login as api_login
 from ..api import points as api_points
 from ..api import campus_loop as api_loop
+from ..api import policy as api_policy
 from ..config import (
     load_identity, save_identity, load_config, save_config,
     set_amap_key, get_amap_key, clear_loop_cache, DATA_DIR,
@@ -55,13 +57,15 @@ def cmd_init(args):
     arg_lng = getattr(args, "lng", None)
     arg_key = getattr(args, "key", None)
     arg_device = getattr(args, "device", None)
+    arg_before_min = getattr(args, "before_min", 30) or 30
+    arg_before_max = getattr(args, "before_max", 300) or 300
 
     non_interactive = bool(arg_user and arg_pass)
     cfg = load_config()
     idn = load_identity()
 
     # 1. 账号
-    step("[1/5] 账号")
+    step("[1/6] 账号")
     if non_interactive:
         username, password = arg_user, arg_pass
         print(f"  手机号: {username}")
@@ -78,7 +82,7 @@ def cmd_init(args):
     print()
 
     # 2. 学校位置
-    step("[2/5] 学校位置")
+    step("[2/6] 学校位置")
     if arg_city:
         city = arg_city
         lat = float(arg_lat) if arg_lat else None
@@ -99,8 +103,32 @@ def cmd_init(args):
             lat = lng = None
     print()
 
-    # 3. 高德 Key
-    step("[3/5] 高德 Key（用于生成校园环，可留空）")
+    # 3. 提交时间提前量
+    step("[3/6] 提交时间提前量（分钟）")
+    if non_interactive:
+        bmin = int(arg_before_min)
+        bmax = int(arg_before_max)
+        if bmax < bmin:
+            bmin, bmax = bmax, bmin
+        print(f"  提前 {bmin}~{bmax} 分钟")
+    else:
+        raw = _prompt("最短提前（分钟）", str(cfg.get("start_before_min", 30)))
+        try:
+            bmin = max(1, int(raw))
+        except ValueError:
+            bmin = 30
+        raw2 = _prompt("最长提前（分钟）", str(cfg.get("start_before_max", 300)))
+        try:
+            bmax = max(1, int(raw2))
+        except ValueError:
+            bmax = 300
+        if bmax < bmin:
+            bmin, bmax = bmax, bmin
+        print(f"  → 提前 {bmin}~{bmax} 分钟" + ("（固定）" if bmin == bmax else ""))
+    print()
+
+    # 4. 高德 Key
+    step("[4/6] 高德 Key（用于生成校园环，可留空）")
     current_key = get_amap_key()
     if arg_key is not None:
         amap_key = arg_key
@@ -110,8 +138,8 @@ def cmd_init(args):
         amap_key = _prompt(f"LBS Key（当前：{hint}）", "")
     print()
 
-    # 4. 设备身份
-    step("[4/5] 设备身份")
+    # 5. 设备身份
+    step("[5/6] 设备身份")
     if arg_device == "new":
         device_choice = 0
     elif arg_device == "keep":
@@ -136,13 +164,15 @@ def cmd_init(args):
         dim(f"保留 device_id={idn.get('device_id', '')}")
     print()
 
-    # 5. 保存与验证
-    step("[5/5] 保存与验证")
+    # 6. 保存与验证
+    step("[6/6] 保存与验证")
 
     cfg["username"] = username
     cfg["password"] = password
     cfg["remember"] = True
     cfg["city"] = city
+    cfg["start_before_min"] = bmin
+    cfg["start_before_max"] = bmax
     if lat is not None:
         idn["anchor_lat"] = lat
         idn["anchor_lon"] = lng
@@ -209,6 +239,34 @@ def cmd_init(args):
             warn(f"环生成失败：{e}")
     else:
         dim("未配置高德 Key，跳过校园环生成")
+
+    # 时间窗口信息
+    print()
+    try:
+        pol = api_policy.fetch_policy(client)
+        if pol.valid_time:
+            step("  时间窗口")
+            for w in pol.valid_time:
+                print(f"    {w.get('start')} ~ {w.get('end')}")
+            now_t = datetime.now().time()
+            inside = False
+            for w in pol.valid_time:
+                try:
+                    ws = dtime.fromisoformat(w["start"])
+                    we = dtime.fromisoformat(w["end"])
+                    if ws <= now_t <= we:
+                        inside = True
+                        break
+                except Exception:
+                    continue
+            if inside:
+                ok("当前时间在窗口内，可以直接 run")
+            else:
+                warn("当前时间不在窗口内，run 会被拒绝（可加 --allow-outside 强制）")
+        else:
+            dim("policy 未返回时间窗口")
+    except Exception as e:
+        warn(f"拉取时间窗口失败：{e}")
 
     print()
     print("=" * 60)

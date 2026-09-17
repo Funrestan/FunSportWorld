@@ -18,16 +18,41 @@ from ..config import (
 from ..logger import log, ok, err, warn, info
 
 
+# ── init ────────────────────────────────────────────────────
+def cmd_init(args):
+    from . import init_cmd
+    init_cmd.cmd_init(args)
+
+
 # ── login / logout ─────────────────────────────────────────
 def cmd_login(args):
     from ..api import login as api_login
     identity = load_identity()
     client = ApiClient(identity)
-    sess = api_login.login(client, args.user, args.pass_)
-    if args.remember:
+
+    # 优先用命令行参数，否则从 config.json 读取
+    user = getattr(args, "user", None)
+    pwd = getattr(args, "pass_", None)
+
+    if not user or not pwd:
         cfg = load_config()
-        cfg["username"] = args.user
-        cfg["password"] = args.pass_
+        cfg_user = (cfg.get("username") or "").strip()
+        cfg_pass = (cfg.get("password") or "").strip()
+        if not cfg_user or not cfg_pass:
+            err("未提供账号密码，且 config.json 中没有保存的凭据")
+            err("用法：python -m funsport login --user 手机号 --pass 密码")
+            err("或先执行：python -m funsport init")
+            sys.exit(1)
+        user = user or cfg_user
+        pwd = pwd or cfg_pass
+        ok(f"从 config.json 读取账号：{user}")
+
+    sess = api_login.login(client, user, pwd)
+
+    if getattr(args, "remember", False):
+        cfg = load_config()
+        cfg["username"] = user
+        cfg["password"] = pwd
         cfg["remember"] = True
         save_config(cfg)
         ok("凭据已保存")
@@ -105,6 +130,9 @@ def cmd_run(args):
     from ..api import flow
     client = make_client()
 
+    before = getattr(args, "before", 0) or 0
+    allow_outside = getattr(args, "allow_outside", False)
+
     if args.time:
         h, m = args.time.split(":")
         base = datetime.now() - timedelta(days=args.days_ago)
@@ -136,6 +164,8 @@ def cmd_run(args):
         cadence_min=args.cadence_min,
         cadence_max=args.cadence_max,
         min_dist=args.min_dist,
+        before=before,
+        allow_outside_window=allow_outside,
     )
     print()
     ok(f"跑步成功 rrid={result['rrid']} uuid={result['uuid']}")
