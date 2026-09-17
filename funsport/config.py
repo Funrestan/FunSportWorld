@@ -11,13 +11,7 @@ DISCOVERY = "https://discovery.gxapp.iydsj.com"
 
 
 def _find_data_dir() -> Path:
-    """定位 .funsport 目录。
-
-    优先级：
-    1. 环境变量 FUNSPORT_DATA_DIR
-    2. 从当前文件向上找项目根（含 .git 或 funsport/ 子目录）
-    3. cwd/.funsport
-    """
+    """定位 .funsport 目录。"""
     env = os.environ.get("FUNSPORT_DATA_DIR", "").strip()
     if env:
         p = Path(env).expanduser().resolve()
@@ -83,7 +77,7 @@ def load_identity() -> dict:
     idn.setdefault("device_name", "iPhone")
     idn.setdefault("anchor_lat", 38.901678)
     idn.setdefault("anchor_lon", 121.540241)
-    idn.setdefault("city", "大连市")
+    idn.setdefault("city", "成都市")
     idn.setdefault("idfa", "")
     if dirty:
         save_json(IDENTITY_FILE, idn)
@@ -117,13 +111,14 @@ DEFAULT_CONFIG = {
     "pace_max": 480,
     "face_check": True,
     "amap_key": "",
+    "city": "成都市",              # ← 新增：默认城市
     # ── auto 模式参数 ──
-    "auto_dist_extra_min": 0.10,   # 学校要求 × (1+0.10) 起
-    "auto_dist_extra_max": 0.30,   # 学校要求 × (1+0.30) 止
-    "auto_pace_min_s": 360,        # 6'00"/km
-    "auto_pace_max_s": 480,        # 8'00"/km
-    "auto_cadence_min": 130,       # 步频下限 spm
-    "auto_cadence_max": 170,       # 步频上限 spm
+    "auto_dist_extra_min": 0.10,
+    "auto_dist_extra_max": 0.30,
+    "auto_pace_min_s": 360,
+    "auto_pace_max_s": 480,
+    "auto_cadence_min": 130,
+    "auto_cadence_max": 170,
 }
 
 
@@ -152,6 +147,16 @@ def set_amap_key(key: str):
     save_config(cfg)
 
 
+def get_city() -> str:
+    """优先级：config.json > identity.json > 默认。"""
+    cfg = load_config()
+    c = (cfg.get("city") or "").strip()
+    if c:
+        return c
+    idn = load_identity()
+    return (idn.get("city") or "成都市").strip()
+
+
 def clear_loop_cache():
     """删除环缓存（下次 --use-map 强制重新生成）。"""
     p = DATA_DIR / "campus_loop_bd.json"
@@ -170,7 +175,6 @@ def set_config(**kwargs):
             continue
         if k in cfg:
             try:
-                # 数值字段自动转类型
                 if isinstance(cfg[k], float):
                     cfg[k] = float(v)
                 elif isinstance(cfg[k], int):
