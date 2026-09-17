@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 
 from .logger import log, ok, err, warn, info
 from .config import (load_identity, load_session, save_session, clear_session,
-                     load_config, save_config, set_amap_key, clear_loop_cache)
+                     load_config, save_config, set_amap_key, clear_loop_cache,
+                     set_config)
 from .api.client import ApiClient
 
 
@@ -57,6 +58,16 @@ def cmd_points(args):
                  f"BD=({p.get('lat')},{p.get('lon')})")
 
 
+def cmd_policy(args):
+    from .api import policy as api_policy
+    client = make_client()
+    pol = api_policy.fetch_policy(client)
+    print(f"policy       = {pol.policy}")
+    print(f"min_distance = {pol.min_distance} m")
+    print(f"valid_time   = {pol.valid_time}")
+    print(f"timestamp    = {pol.timestamp}")
+
+
 def cmd_lbs_amap(args):
     set_amap_key(args.key)
     ok(f"高德 Key 已写入 config.json：{args.key[:8]}…")
@@ -72,11 +83,30 @@ def cmd_loop_rebuild(args):
     ok(f"环已重建：{len(ring)} 点 → .funsport/campus_loop_bd.json")
 
 
+def cmd_config(args):
+    cfg = load_config()
+    if args.set:
+        # k=v 形式批量更新
+        updates = {}
+        for pair in args.set:
+            if "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            updates[k.strip()] = v.strip()
+        n = set_config(**updates)
+        ok(f"已更新 {n} 项")
+        return
+    # 无参数：打印当前配置
+    for k in sorted(cfg.keys()):
+        v = cfg[k]
+        if k == "password" and v:
+            v = v[:2] + "***"
+        print(f"{k:24s} = {v}")
+
+
 def cmd_run(args):
     from .api import flow
     client = make_client()
-    dist = args.dist * 1000
-    dur = int(dist / 1000 * args.pace)
 
     if args.time:
         h, m = args.time.split(":")
@@ -87,17 +117,45 @@ def cmd_run(args):
     elif args.ago:
         start_ms = int(time.time() * 1000) - args.ago * 60_000
     else:
-        start_ms = int(time.time() * 1000) - random.randint(30, 300) * 60_000
+        start_ms = 0  # 让 flow 随机
 
-    tag = " / 真实路径（高德环）" if args.use_map else ""
-    log.info(f"参数：{dist:.0f}m / {dur}s / 配速 {args.pace}s/km / 开始 {fmt_hms(start_ms)}{tag}")
+    tag = " / AUTO" if args.auto else (" / 真实路径" if args.use_map else "")
+    log.info(f"参数：{tag.strip() or '手动'}")
+    if args.dist:
+        log.info(f"  --dist={args.dist} km")
+    if args.dist_min or args.dist_max:
+        log.info(f"  --dist-min={args.dist_min} --dist-max={args.dist_max}")
+    if args.pace:
+        log.info(f"  --pace={args.pace} s/km")
+    if args.pace_min or args.pace_max:
+        log.info(f"  --pace-min={args.pace_min} --pace-max={args.pace_max}")
+    if args.cadence:
+        log.info(f"  --cadence={args.cadence} spm")
+    if args.cadence_min or args.cadence_max:
+        log.info(f"  --cadence-min={args.cadence_min} --cadence-max={args.cadence_max}")
 
-    result = flow.run_full_flow(client, dist, dur, start_ms,
-                                face_check=1 if args.face else 0,
-                                seed=args.seed,
-                                use_map=args.use_map)
+    result = flow.run_full_flow(
+        client,
+        dist=args.dist or 0,
+        pace=args.pace or 0,
+        cadence=args.cadence or 0,
+        start_ms=start_ms,
+        face_check=1 if args.face else 0,
+        seed=args.seed,
+        use_map=args.use_map,
+        auto=args.auto,
+        dist_min=args.dist_min,
+        dist_max=args.dist_max,
+        pace_min=args.pace_min,
+        pace_max=args.pace_max,
+        cadence_min=args.cadence_min,
+        cadence_max=args.cadence_max,
+        min_dist=args.min_dist,
+    )
     print()
     ok(f"跑步成功 rrid={result['rrid']} uuid={result['uuid']}")
+    ok(f"距离 {result['dist']:.0f}m / 时长 {result['dur']}s / "
+       f"平均步频 {result['cadence_avg']:.0f}spm")
     ok(f"OBS {result['obs_ok']}/2 · 验证 {'通过' if result['detail_ok'] else '未通过'}")
 
 
@@ -215,6 +273,9 @@ def main():
     sp = sub.add_parser("points", help="查看整组打卡点")
     sp.set_defaults(func=cmd_points)
 
+    sp = sub.add_parser("policy", help="查看跑步策略（学校要求）")
+    sp.set_defaults(func=cmd_policy)
+
     sp = sub.add_parser("lbs-amap", help="配置高德 LBS Key（写入 config.json）")
     sp.add_argument("--key", required=True, help="高德 Web 服务 Key")
     sp.set_defaults(func=cmd_lbs_amap)
@@ -222,12 +283,33 @@ def main():
     sp = sub.add_parser("loop-rebuild", help="强制重建校园环（高德）")
     sp.set_defaults(func=cmd_loop_rebuild)
 
+    sp = sub.add_parser("config", help="查看/设置配置（config set k=v）")
+    sp.add_argument("--set", nargs="*", help="k=v 列表，如 --set auto_pace_min_s=350")
+    sp.set_defaults(func=cmd_config)
+
+    # ── run ──
     sp = sub.add_parser("run", help="跑步全链")
-    sp.add_argument("--dist", type=float, default=1.2, help="距离 km")
-    sp.add_argument("--pace", type=float, default=400, help="配速 秒/km")
+    # 距离
+    sp.add_argument("--dist", type=float, default=0, help="固定距离 km")
+    sp.add_argument("--dist-min", type=float, help="距离下限 km")
+    sp.add_argument("--dist-max", type=float, help="距离上限 km")
+    sp.add_argument("--min-dist", type=int, help="强制里程下限 米（覆盖学校要求）")
+    # 配速
+    sp.add_argument("--pace", type=float, default=0, help="固定配速 秒/km")
+    sp.add_argument("--pace-min", type=float, help="配速下限 秒/km")
+    sp.add_argument("--pace-max", type=float, help="配速上限 秒/km")
+    # 步频
+    sp.add_argument("--cadence", type=float, default=0, help="固定步频 spm")
+    sp.add_argument("--cadence-min", type=float, help="步频下限 spm")
+    sp.add_argument("--cadence-max", type=float, help="步频上限 spm")
+    # 自动
+    sp.add_argument("--auto", action="store_true",
+                    help="全自动：距离按学校要求+冗余、配速/步频按配置随机、自动 --use-map")
+    # 时间
     sp.add_argument("--ago", type=int, default=0, help="N 分钟前")
     sp.add_argument("--days-ago", type=int, default=0)
     sp.add_argument("--time", help="HH:MM")
+    # 其他
     sp.add_argument("--face", action="store_true", default=True)
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--use-map", action="store_true",

@@ -9,8 +9,38 @@ from pathlib import Path
 HOST = "https://run.gxapp.iydsj.com"
 DISCOVERY = "https://discovery.gxapp.iydsj.com"
 
-DATA_DIR = Path(os.getcwd()) / ".funsport"
-DATA_DIR.mkdir(exist_ok=True)
+
+def _find_data_dir() -> Path:
+    """定位 .funsport 目录。
+
+    优先级：
+    1. 环境变量 FUNSPORT_DATA_DIR
+    2. 从当前文件向上找项目根（含 .git 或 funsport/ 子目录）
+    3. cwd/.funsport
+    """
+    env = os.environ.get("FUNSPORT_DATA_DIR", "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    here = Path(__file__).resolve()
+    for parent in [here.parent] + list(here.parents):
+        if (parent / ".git").exists() or (parent / "funsport").is_dir():
+            p = parent / ".funsport"
+            p.mkdir(exist_ok=True)
+            return p
+        if parent.name == "funsport":
+            p = parent.parent / ".funsport"
+            p.mkdir(exist_ok=True)
+            return p
+
+    p = Path(os.getcwd()) / ".funsport"
+    p.mkdir(exist_ok=True)
+    return p
+
+
+DATA_DIR = _find_data_dir()
 
 IDENTITY_FILE = DATA_DIR / "identity.json"
 SESSION_FILE  = DATA_DIR / "session.json"
@@ -86,7 +116,14 @@ DEFAULT_CONFIG = {
     "pace_min": 360,
     "pace_max": 480,
     "face_check": True,
-    "amap_key": "",            # 高德 Key（lbs-amap 写入）
+    "amap_key": "",
+    # ── auto 模式参数 ──
+    "auto_dist_extra_min": 0.10,   # 学校要求 × (1+0.10) 起
+    "auto_dist_extra_max": 0.30,   # 学校要求 × (1+0.30) 止
+    "auto_pace_min_s": 360,        # 6'00"/km
+    "auto_pace_max_s": 480,        # 8'00"/km
+    "auto_cadence_min": 130,       # 步频下限 spm
+    "auto_cadence_max": 170,       # 步频上限 spm
 }
 
 
@@ -122,6 +159,29 @@ def clear_loop_cache():
         p.unlink()
         return True
     return False
+
+
+def set_config(**kwargs):
+    """批量更新配置项（只更新已存在的键）。"""
+    cfg = load_config()
+    n = 0
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        if k in cfg:
+            try:
+                # 数值字段自动转类型
+                if isinstance(cfg[k], float):
+                    cfg[k] = float(v)
+                elif isinstance(cfg[k], int):
+                    cfg[k] = int(v)
+                else:
+                    cfg[k] = v
+                n += 1
+            except (ValueError, TypeError):
+                pass
+    save_config(cfg)
+    return n
 
 
 # ── 缓存 ────────────────────────────────────────────────────

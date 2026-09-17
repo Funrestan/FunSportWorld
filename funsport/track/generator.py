@@ -35,16 +35,21 @@ def _dip_factor(tt, dips):
     return f
 
 
-def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
+def build(dist, dur, seed, start_ms, points_bd,
+          ordered_path=False, cadence_target=0):
+    """生成轨迹。
+
+    cadence_target: 目标步频 spm（0 = 自动按速度推算）
+    """
     rng = Rng(seed)
     log.info(f"[track] 生成 {dist:.0f}m / {dur}s seed={seed} "
-             f"点位={len(points_bd)} 模式={'真实路径' if ordered_path else '拟合环'}")
+             f"点位={len(points_bd)} 模式={'真实路径' if ordered_path else '拟合环'}"
+             f" 步频={cadence_target:.0f}spm" if cadence_target > 0 else "")
 
     dense, arcs, (c_lat, c_lng) = make_point_ring(points_bd, ordered=ordered_path)
     ring_len = arcs[-1] if arcs else 0.0
 
     if ordered_path:
-        # 真实路径：固定方向、从起点出发；只跑 dist 米（弧长在 dist 处停）
         direction = 1.0
         s0 = 0.0
         s_limit = dist
@@ -61,7 +66,6 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
     phase_v = rng.uniform(0, math.tau)
     phase_l = rng.uniform(0, math.tau)
 
-    # 时间采样
     times = []
     t = 0.0
     while t < dur:
@@ -72,7 +76,6 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
     dips = _make_dips(rng, dur)
     base = dist / dur
 
-    # 速度曲线（时间维度）
     w = []
     for tt in times:
         ramp = 1.0
@@ -94,7 +97,6 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
     fit_speeds(w, dts, dist)
     dim(f"速度拟合：{n_max} 点 平均 {dist/dur:.2f} m/s")
 
-    # 点位类型分布
     kinds = []
     for _ in range(n_max):
         u = rng.random()
@@ -112,7 +114,6 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
         if kinds[i][0] == -1 and kinds[i - 1][0] == -1:
             kinds[i] = (rng.choice([3, 0]), 1)
 
-    # 主循环
     locs = []
     s = s0
     t_acc = dist_acc = steps_acc = 0.0
@@ -146,12 +147,17 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
         lat, lng = to_bd(px, py, c_lat, c_lng)
         alt += 0.04 * (82.0 - alt) + rng.gauss(0, alt_sigma)
 
+        # ── 步频：优先用 cadence_target ──
         v_now = dist / dur
-        stride = (0.62 + 0.17 * v_now
-                  + 0.03 * math.sin(math.tau * t_acc / 200 + phase_l)
-                  + rng.gauss(0, 0.008))
-        v_cad = v_now * (1 + 0.03 * math.sin(math.tau * t_acc / 70 + phase_v))
-        cad = min(max(v_cad / stride * 60, 100), 200)
+        if cadence_target > 0:
+            cad = cadence_target * (1.0 + rng.gauss(0, 0.03))
+            cad = min(max(cad, 60.0), 220.0)
+        else:
+            stride = (0.62 + 0.17 * v_now
+                      + 0.03 * math.sin(math.tau * t_acc / 200 + phase_l)
+                      + rng.gauss(0, 0.008))
+            v_cad = v_now * (1 + 0.03 * math.sin(math.tau * t_acc / 70 + phase_v))
+            cad = min(max(v_cad / stride * 60, 100), 200)
         steps_acc += cad / 60 * dt
 
         if typ == -1:
@@ -198,7 +204,6 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
     from .postfix import apply_post_fixes
     apply_post_fixes(locs, rng, start_ms)
 
-    # 点位吸附：真实路径下半径收紧
     snap_radius = 20.0 if ordered_path else 40.0
     for pl in points_bd:
         best_i, best_d = None, 1e18
@@ -211,10 +216,10 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
             locs[best_i]["gLat"] = round_to(pl[0], 7)
             locs[best_i]["gLng"] = round_to(pl[1], 7)
 
-    # 10s 窗
     speed_win, steps_win = [], []
     ten_t = ten_d = ten_st = 0.0
-    for i in range(len(locs)):
+    n_used = len(locs)
+    for i in range(n_used):
         ten_t += dts[i] if i < len(dts) else 0.0
         ten_d += w[i] * (dts[i] if i < len(dts) else 0.0)
         ten_st += (locs[i]["steps"] - (locs[i - 1]["steps"] if i else 0))
@@ -246,5 +251,7 @@ def build(dist, dur, seed, start_ms, points_bd, ordered_path=False):
         "speedPerTenSec": speed_win,
         "stepsPerTenSec": steps_win,
     }
-    ok(f"轨迹完成 {len(locs)} 点 totalDis={track['totalDistance']:.0f}m steps={track['totalSteps']}")
+    avg_cad = (track["totalSteps"] / total_t_actual * 60) if total_t_actual > 0 else 0
+    ok(f"轨迹完成 {len(locs)} 点 totalDis={track['totalDistance']:.0f}m "
+       f"steps={track['totalSteps']} 平均步频={avg_cad:.0f}spm")
     return track
