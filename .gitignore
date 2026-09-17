@@ -1,0 +1,83 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ── 虚拟环境 ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── 打包/构建 ─────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# ── 测试/覆盖率 ───────────────────────────────────────────
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+
+# ── 类型检查/格式化 ───────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# ── IDE ───────────────────────────────────────────────────
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
+
+# ── 运行期数据（含账号、token、设备指纹，严禁提交）────────
+.funsport/
+*.funsport
+
+# 保险：以下文件若出现在别处也一并忽略
+identity.json
+session.json
+config.json
+points_cache.json
+ai_sports.json
+
+# ── 日志/输出 ─────────────────────────────────────────────
+*.log
+logs/
+obs_*.json
+*_real.json
+*_ours.json
+
+# ── 系统 ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 编辑器临时文件 ────────────────────────────────────────
+*.bak
+*.tmp
+*.orig
+*.rej
+
+# ── 敏感信息（防止手滑）──────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+credentials.*
