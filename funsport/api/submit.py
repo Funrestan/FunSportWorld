@@ -1,6 +1,7 @@
 """跑步提交。"""
 import json
 import uuid
+from .errors import BusinessError
 
 from ..config import HOST
 from ..crypto.envelope import build_envelope, now_ms
@@ -58,6 +59,7 @@ def total_ascent(locs):
 
 def submit_record(client, track, policy_ts, policy, min_distance,
                   weight=68.0, face_check=1, five_point_json=""):
+    """提交记录，并在业务拒绝时保留错误码和提交接口上下文。"""
     total_time = track["totalTime"]
     total_dis = track["totalDistance"]
     total_steps = track["totalSteps"]
@@ -156,7 +158,7 @@ def submit_record(client, track, policy_ts, policy, min_distance,
     dec = decrypt_response(resp.content, key)
     biz = dec.business
     if biz.get("error") != 10000:
-        raise RuntimeError(f"提交失败 {biz.get('error')}: {biz.get('message')}")
+        raise BusinessError(biz.get("error"), biz.get("message") or biz.get("msg"), RECORD_PATH)
 
     rrid = get_field(biz, "rrid") or 0
     if not rrid:

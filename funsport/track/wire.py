@@ -2,33 +2,28 @@
 import gzip
 import base64
 import json
-import math
 
 from .geom import round_to
-
-
-def bd09_to_gcj02(bd_lat, bd_lng):
-    X_PI = math.pi * 3000.0 / 180.0
-    x = bd_lng - 0.0065
-    y = bd_lat - 0.006
-    z = math.sqrt(x * x + y * y) - 0.00002 * math.sin(y * X_PI)
-    theta = math.atan2(y, x) - 0.000003 * math.cos(x * X_PI)
-    return z * math.sin(theta), z * math.cos(theta)
+from ..coordinates import bd09_to_gcj02, checkpoint_coordinates
 
 
 def gz(data: bytes) -> str:
+    """按 OBS 字段约定压缩字节并编码为 Base64 字符串。"""
     return base64.b64encode(gzip.compress(data)).decode()
 
 
 def gz_str(s: str) -> str:
+    """将 UTF-8 文本编码成 OBS 使用的压缩字段。"""
     return gz(s.encode())
 
 
 def gz_json(v) -> str:
+    """将对象序列化为紧凑 JSON 后压缩，不再嵌套额外引号。"""
     return gz(json.dumps(v, separators=(",", ":")).encode())
 
 
 def conv_point(p, start_ms):
+    """把生成器的 BD 采样转换成 App MyLocation 的 GCJ 坐标字段。"""
     glat, glng = bd09_to_gcj02(p["gLat"], p["gLng"])
     return {
         "avgSpeed": round_to(p["avgSpeed"], 4),
@@ -61,36 +56,44 @@ def conv_point(p, start_ms):
 
 
 def five_point_payload(points, start_ms):
+    """保留源点位身份和状态，两套坐标统一到同一位置，不推断通过。"""
     out = []
     for i, p in enumerate(points):
+        bd, gcj, _, _ = checkpoint_coordinates(p)
         out.append({
             "flag": start_ms,
-            "glat": float(p.get("glat", 0.0)),
-            "glon": float(p.get("glon", 0.0)),
-            "id": i + 1,
+            "glat": round(gcj[0], 7),
+            "glon": round(gcj[1], 7),
+            "id": p["id"] if p.get("id") is not None else i + 1,
             "isFixed": p.get("isFixed", 0),
-            "isPass": True,
-            "lat": float(p.get("lat", 0.0)),
-            "lon": float(p.get("lon", 0.0)),
+            "isPass": p.get("isPass") is True,
+            "lat": round(bd[0], 7),
+            "lon": round(bd[1], 7),
             "pointName": p.get("pointName", ""),
-            "position": 999,
-            "state": 0,
+            "position": p.get("position", 999),
+            "state": p.get("state", 0),
         })
     return out
 
 
-def five_point_wrapper(points, start_ms):
+def five_point_wrapper(points, start_ms, metadata=None):
+    """保留接口提供的跑区和围栏，保持官方 PointJsonEntity 的双层结构。"""
     five = five_point_payload(points, start_ms)
+    metadata = metadata or {}
+    fences = metadata.get("geoFencesJson", "[]")
+    if fences is not None and not isinstance(fences, str):
+        fences = json.dumps(fences, separators=(",", ":"))
     return json.dumps({
         "useZip": False,
         "fivePointJson": json.dumps(five, separators=(",", ":")),
-        "runAreaId": -1,
-        "geoFencesJson": "[]",
-        "freedomShowFence": False,
+        "runAreaId": metadata.get("runAreaId", -1),
+        "geoFencesJson": fences,
+        "freedomShowFence": metadata.get("freedomShowFence", False),
     }, separators=(",", ":"))
 
 
 def build_windows(track, rrid):
+    """将十秒距离和步数窗口转换成 App 的速度及步频记录。"""
     start_ms = track["startTime"]
     total_time = track["totalTime"]
     sp, stf = [], []
@@ -110,6 +113,7 @@ def build_windows(track, rrid):
 
 
 def build_laps(track, start_ms):
+    """按累计里程拆分每公里和末尾不足一公里的分段统计。"""
     laps = []
     locs = track["locations"]
     prev_d = prev_t = prev_steps = 0
@@ -147,20 +151,14 @@ def build_laps(track, start_ms):
     return laps
 
 
-def build_obs_object(track, rrid, uuid_str, uid, live_points):
+def build_obs_object(track, rrid, uuid_str, uid, live_points, point_wrapper=None):
+    """组装 OBS；已有方案时复用提交的同一份点位包装。"""
     start_ms = track["startTime"]
     pts = [conv_point(p, start_ms) for p in track["locations"]]
     run_wrap = {"allLocJson": json.dumps(pts, separators=(",", ":")), "useZip": False}
     sp, stf = build_windows(track, rrid)
     laps = build_laps(track, start_ms)
-    five = five_point_payload(live_points, start_ms)
-    fx = {
-        "fivePointJson": json.dumps(five, separators=(",", ":")),
-        "freedomShowFence": False,
-        "geoFencesJson": "[]",
-        "runAreaId": -1,
-        "useZip": False,
-    }
+    fx = json.loads(point_wrapper if point_wrapper is not None else five_point_wrapper(live_points, start_ms))
     return {
         "rrid": gz_str(str(rrid)),
         "uuid": gz_str(uuid_str),
@@ -176,6 +174,7 @@ def build_obs_object(track, rrid, uuid_str, uid, live_points):
 
 
 def obs_keys(track, rrid, uuid_str):
+    """按开始小时、UUID 和记录 ID 生成现有的两个 OBS 对象键。"""
     import datetime
     t0 = datetime.datetime.fromtimestamp(track["startTime"] / 1000).strftime("%Y%m%d%H")
     return [

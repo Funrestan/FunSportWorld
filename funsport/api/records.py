@@ -9,6 +9,7 @@ GET_ONE_PATH = "/api/v70260/runnings/get_one_record"
 
 
 def fetch_records(client):
+    """读取记录摘要，保留服务端未提供达标状态时的未知值。"""
     biz = client.call("POST", RECORDS_PATH, "{}")
     data = parse_data_field(biz)
     if isinstance(data, list):
@@ -24,7 +25,7 @@ def fetch_records(client):
             "total_dis": r.get("totalDis", 0.0),
             "total_time": r.get("totalTime", 0),
             "start_time": r.get("startTime", 0),
-            "complete": r.get("complete", False),
+            "complete": r.get("complete"),
             "avg_step_freq": r.get("avgStepFreq", 0),
             "calorie": r.get("calorie", 0),
             "avg_power": r.get("avgPower", 0),
@@ -36,11 +37,12 @@ def fetch_records(client):
 
 
 def fetch_one_record(client, rrid):
+    """读取指定记录详情，并拒绝把空值或非对象误当成有效详情。"""
     body = json.dumps({"rrid": rrid, "uuid": None, "calculateBadge": False})
     biz = client.call("POST", GET_ONE_PATH, body)
     inner = parse_data_field(biz)
     if isinstance(inner, dict) and "data" in inner:
         inner = parse_data_field(inner)
-    if not inner:
-        raise RuntimeError("详情为空")
+    if not isinstance(inner, dict) or not inner:
+        raise RuntimeError("详情为空或格式不是对象")
     return inner

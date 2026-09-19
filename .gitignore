@@ -56,10 +56,16 @@ session.json
 config.json
 points_cache.json
 ai_sports.json
+campus_loop_bd.json
+
+# Local development notes are not release or PR documents.
+/PROGRESS.md
+/TODO.md
 
 # ── 日志/输出 ─────────────────────────────────────────────
 *.log
 logs/
+.artifacts/
 obs_*.json
 *_real.json
 *_ours.json
