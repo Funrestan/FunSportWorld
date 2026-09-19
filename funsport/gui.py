@@ -1,18 +1,18 @@
 """Tkinter 桌面窗口：主线程负责界面，单个后台线程负责网络任务。"""
 import logging
-import math
 import queue
 import threading
 import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from PIL import ImageTk
+
+import tkintermapview
+from PIL import Image, ImageDraw, ImageTk
 
 from . import gui_services as services
-from . import map_preview
 from .run_plan import format_plan
-from .track.wire import five_point_payload
+from .track.wire import five_point_payload, bd09_to_gcj02
 from .diagnostics import analyze_checkpoints, format_report, inspect_file
 from .logger import log
 
@@ -53,20 +53,90 @@ class QueueLogHandler(logging.Handler):
     """将日志送入线程安全队列，不从工作线程操作窗口。"""
 
     def __init__(self, events):
-        """保存 GUI 事件队列。"""
         super().__init__()
         self.events = events
 
     def emit(self, record):
-        """仅排队消息；实际脱敏和显示在主线程进行。"""
         self.events.put(("log", record.getMessage(), None))
 
 
 class App:
     """连接表单、后台任务和已有 API，不在启动时发送网络请求。"""
 
+    # 图标缓存（避免 PhotoImage 被 GC）
+    _icon_cache = {}
+
+    @classmethod
+    def _make_circle_icon(cls, fill, size=28, outline="#ffffff",
+                          outline_width=2, text=""):
+        """橙色实心圆 + 白色编号（Canvas 版打卡点样式）。"""
+        key = ("circle", fill, size, outline, outline_width, text)
+        if key in cls._icon_cache:
+            return cls._icon_cache[key]
+        pad = outline_width
+        img = Image.new("RGBA", (size + pad * 2, size + pad * 2), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse([pad, pad, pad + size, pad + size],
+                  fill=fill, outline=outline, width=outline_width)
+        if text:
+            try:
+                from PIL import ImageFont
+                font = None
+                for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf"):
+                    try:
+                        font = ImageFont.truetype(name, size=int(size * 0.55))
+                        break
+                    except Exception:
+                        continue
+                if font is None:
+                    font = ImageFont.load_default()
+                bbox = d.textbbox((0, 0), text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                d.text((pad + (size - tw) / 2 - bbox[0],
+                        pad + (size - th) / 2 - bbox[1]),
+                       text, fill="white", font=font)
+            except Exception:
+                pass
+        photo = ImageTk.PhotoImage(img)
+        cls._icon_cache[key] = photo
+        return photo
+
+    @classmethod
+    def _make_square_icon(cls, fill, size=26, outline="#ffffff",
+                          outline_width=2, text=""):
+        """方块 + 文字（Canvas 版起终点样式）。"""
+        key = ("sq", fill, size, outline, outline_width, text)
+        if key in cls._icon_cache:
+            return cls._icon_cache[key]
+        pad = outline_width
+        img = Image.new("RGBA", (size + pad * 2, size + pad * 2), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([pad, pad, pad + size, pad + size],
+                    fill=fill, outline=outline, width=outline_width)
+        if text:
+            try:
+                from PIL import ImageFont
+                font = None
+                for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf"):
+                    try:
+                        font = ImageFont.truetype(name, size=int(size * 0.65))
+                        break
+                    except Exception:
+                        continue
+                if font is None:
+                    font = ImageFont.load_default()
+                bbox = d.textbbox((0, 0), text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                d.text((pad + (size - tw) / 2 - bbox[0],
+                        pad + (size - th) / 2 - bbox[1]),
+                       text, fill="white", font=font)
+            except Exception:
+                pass
+        photo = ImageTk.PhotoImage(img)
+        cls._icon_cache[key] = photo
+        return photo
+
     def __init__(self, root):
-        """创建窗口和各页，读取本地设置但不自动登录。"""
         self.root = root
         self.events = queue.Queue()
         self.busy = False
@@ -75,9 +145,13 @@ class App:
         self.plan = None
         self.preview_parameters = None
         self.preview_track = None
-        self.map_view = None
-        self.map_background = None
-        self.map_image = None
+        # tkintermapview 元素引用
+        self.map_widget = None
+        self.track_path = None
+        self.start_marker = None
+        self.end_marker = None
+        self.checkpoint_markers = []
+        self.point_markers = []
         self.has_amap_key = False
         self.secrets = []
         self.run_vars, self.settings_vars = {}, {}
@@ -136,20 +210,17 @@ class App:
         self.poll_id = root.after(80, self.poll)
 
     def page(self, title):
-        """添加统一留白的页签。"""
         frame = ttk.Frame(self.tabs, padding=(16, 10))
         self.tabs.add(frame, text=title)
         return frame
 
     def button(self, parent, text, command, accent=False):
-        """建立可在任务运行时统一禁用的操作按钮。"""
         button = ttk.Button(parent, text=text, command=command,
                             style="Accent.TButton" if accent else "TButton")
         self.buttons.append(button)
         return button
 
     def entry(self, parent, row, label, store, key, default="", secret=False, padding=6):
-        """创建标签和输入框，并把值绑定到指定表单字典。"""
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=padding, padx=(0, 14))
         var = tk.StringVar(value=default)
         store[key] = var
@@ -158,7 +229,6 @@ class App:
         return widget
 
     def build_run(self):
-        """构建先预览后提交的表单、地图页及方案明细页。"""
         self.run_page.columnconfigure(1, weight=1)
         self.run_page.rowconfigure(0, weight=1)
         form = ttk.Frame(self.run_page)
@@ -236,12 +306,24 @@ class App:
         zoom_in.pack(side="right", padx=4)
         self.add_tooltip(zoom_in, "放大地图")
         self.add_tooltip(zoom_out, "缩小地图")
-        self.canvas = tk.Canvas(preview, background="#ffffff", highlightthickness=1,
-                                highlightbackground="#dbe1e8", width=320, height=180)
-        self.canvas.grid(row=2, column=0, sticky="nsew", pady=(10, 8))
-        self.canvas.bind("<Configure>", self.draw_points)
-        self.map_status = tk.StringVar(value="GCJ-02 / 尚未加载底图")
-        ttk.Label(preview, textvariable=self.map_status, wraplength=400, style="Muted.TLabel").grid(row=3, column=0, sticky="ew")
+
+        # ── tkintermapview 地图控件 ──
+        map_frame = ttk.Frame(preview)
+        map_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 8))
+        map_frame.columnconfigure(0, weight=1)
+        map_frame.rowconfigure(0, weight=1)
+        self.map_widget = tkintermapview.TkinterMapView(map_frame, corner_radius=0)
+        self.map_widget.pack(fill="both", expand=True)
+        self.map_widget.set_tile_server(
+            "https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
+            max_zoom=19,
+        )
+        self.map_widget.set_position(30.8885, 103.5965)
+        self.map_widget.set_zoom(16)
+
+        self.map_status = tk.StringVar(value="GCJ-02 / 高德瓦片")
+        ttk.Label(preview, textvariable=self.map_status, wraplength=400,
+                  style="Muted.TLabel").grid(row=3, column=0, sticky="ew")
         details.columnconfigure(0, weight=1)
         details.rowconfigure(0, weight=1)
         self.plan_text = ScrolledText(details, state="disabled", wrap="word", width=35, height=12,
@@ -252,7 +334,6 @@ class App:
         self.sync_modes()
 
     def table(self, parent, columns, widths, height=6):
-        """创建有横纵滚动条的列表，长内容不会挤出窗口。"""
         frame = ttk.Frame(parent)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
@@ -269,7 +350,6 @@ class App:
         return tree
 
     def build_records(self):
-        """建立记录列表、单条记录查询和离线 JSON 诊断入口。"""
         self.record_page.columnconfigure(0, weight=1)
         self.record_page.rowconfigure(2, weight=1)
         bar = ttk.Frame(self.record_page)
@@ -290,7 +370,6 @@ class App:
         self.set_report("尚未选择记录")
 
     def build_tools(self):
-        """提供原工具的策略、学期、排行榜和 AI 项目只读查询。"""
         self.tools_page.columnconfigure(0, weight=1)
         self.tools_page.rowconfigure(1, weight=1)
         bar = ttk.Frame(self.tools_page)
@@ -304,7 +383,6 @@ class App:
         self.tools_text.grid(row=1, column=0, sticky="nsew")
 
     def build_settings(self):
-        """建立凭据和校园位置表单；敏感输入默认遮挡且不自动回填。"""
         form = ttk.Frame(self.settings_page)
         form.pack(anchor="nw")
         self.entry(form, 0, "账号 / 手机号", self.settings_vars, "username")
@@ -331,7 +409,6 @@ class App:
             row=0, column=2, rowspan=3, sticky="nw", padx=(28, 0), pady=6)
 
     def sync_modes(self):
-        """按自动和时间模式禁用无效输入，避免界面与实际参数不一致。"""
         for widget in self.manual_fields:
             widget.configure(state="disabled" if self.run_vars["auto"].get() else "normal")
         if not self.run_vars["use_map"].get():
@@ -341,11 +418,9 @@ class App:
         self.time_entry.configure(state="normal" if mode == "at" else "disabled")
 
     def values(self, store):
-        """在主线程复制表单值，后台任务不直接访问 Tk 变量。"""
         return {key: var.get() for key, var in store.items()}
 
     def apply_snapshot(self, snapshot):
-        """刷新本地配置和会话提示，不展示密码或令牌。"""
         if snapshot.get("reset_views"):
             self.clear_account_views()
         for key, value in snapshot.items():
@@ -358,7 +433,6 @@ class App:
             "是" if snapshot["has_password"] else "否", "已配置" if snapshot["has_amap_key"] else "未配置"))
 
     def start_job(self, title, action, callback=None):
-        """串行执行任务，禁用重复提交并通过队列返回结果。"""
         if self.busy:
             return False
         self.secrets = [self.settings_vars[key].get() for key in ("username", "password", "amap_key")]
@@ -373,7 +447,6 @@ class App:
             widget.state(["disabled"])
 
         def work():
-            """执行与 Tk 无关的工作，把结果或异常交回主线程。"""
             try:
                 result = action()
                 self.events.put(("done", result, callback))
@@ -385,14 +458,12 @@ class App:
         return True
 
     def input_widgets(self, parent):
-        """遍历表单输入控件，以便任务进行时锁定当前参数。"""
         for widget in parent.winfo_children():
             if isinstance(widget, (ttk.Entry, ttk.Checkbutton, ttk.Radiobutton, ttk.Combobox)):
                 yield widget
             yield from self.input_widgets(widget)
 
     def poll(self):
-        """定时处理后台事件，恢复按钮并将异常显示为对话框。"""
         for _ in range(150):
             try:
                 kind, value, callback = self.events.get_nowait()
@@ -423,7 +494,6 @@ class App:
         self.poll_id = self.root.after(80, self.poll)
 
     def append_log(self, message):
-        """脱敏后显示日志，并限制行数以免长时间使用占满内存。"""
         text = services.safe_text(message, self.secrets)
         self.log_text.configure(state="normal")
         self.log_text.insert("end", datetime.now().strftime("%H:%M:%S ") + text + "\n")
@@ -433,19 +503,16 @@ class App:
         self.log_text.configure(state="disabled")
 
     def clear_log(self):
-        """只清空界面日志，不删除任何本地数据文件。"""
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
     def show_error(self, message):
-        """显示脱敏错误，不输出原始堆栈或完整服务端响应。"""
         text = services.safe_text(message, self.secrets)
         self.append_log(text)
         messagebox.showerror("操作失败", text, parent=self.root)
 
     def save_settings(self):
-        """保存用户明确确认的设置，保存后清空敏感输入框。"""
         values = self.values(self.settings_vars)
         if values["remember"] and values["password"]:
             if not messagebox.askyesno("保存密码", "密码将明文保存在本机 .funsport 目录。继续？", parent=self.root):
@@ -453,26 +520,22 @@ class App:
         self.start_job("保存设置", lambda: services.save_settings(values), self.apply_snapshot)
 
     def login(self):
-        """仅在点击登录后调用现有登录链，不在后台自动尝试。"""
         values = self.values(self.settings_vars)
         self.start_job("登录", lambda: services.login_account(values["username"], values["password"]), self.login_done)
 
     def login_done(self, result):
-        """显示登录结果并清空临时密码，保留用户尚未保存的其他表单。"""
         self.settings_vars["password"].set("")
         self.account_status.set("已登录")
         self.clear_account_views()
         self.append_log(result)
 
     def logout(self):
-        """确认后在后台请求服务器退出，成功回调前不清理会话或账号视图。"""
         if self.busy:
             return
         if messagebox.askyesno("退出登录", "向服务器退出当前账号？\n服务器确认成功后清除本地会话；失败则保留会话。", parent=self.root):
             self.start_job("请求服务器退出", services.logout_account, self.logout_done)
 
     def logout_done(self, result):
-        """服务器确认后清空预览，明确区分正常退出与本地文件清理失败。"""
         self.account_status.set("未登录" if result["local_cleared"] else "服务器已退出（本地清理失败）")
         self.settings_vars["password"].set("")
         self.clear_account_views()
@@ -482,11 +545,8 @@ class App:
             messagebox.showwarning("退出后的本地清理失败", result["message"], parent=self.root)
 
     def clear_account_views(self):
-        """账号或校园变化后清空旧点位、记录、报告和查询结果。"""
         self.points = []
         self.invalidate_plan()
-        self.map_view = None
-        self.map_background = None
         self.point_tree.delete(*self.point_tree.get_children())
         self.record_tree.delete(*self.record_tree.get_children())
         self.rrid.set("")
@@ -496,12 +556,10 @@ class App:
         self.draw_points()
 
     def load_points(self):
-        """在后台读取服务端点位或现有缓存。"""
         from .api.points import fetch_points
         self.start_job("读取打卡点", lambda: services.with_client(fetch_points), self.show_points)
 
     def show_points(self, points):
-        """把点位填入表格和图中，不把它们标记为已完成。"""
         normalized = five_point_payload(points, 0)
         self.invalidate_plan()
         self.points = normalized
@@ -515,43 +573,103 @@ class App:
             self.root.after_idle(self.load_map)
 
     def draw_points(self, event=None):
-        """按上传精度和已核实的App历史连线规则绘制轨迹、起终点及打卡点。"""
-        self.canvas.delete("all")
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if not self.map_view:
-            self.canvas.create_text(width / 2, height / 2, text="暂无路线", fill="#8491a1", font=("Microsoft YaHei UI", 12))
-            return
-        center, zoom = self.map_view
-        if self.map_background is not None:
-            self.map_image = ImageTk.PhotoImage(self.map_background, master=self.root)
-            self.canvas.create_image(width / 2, height / 2, image=self.map_image)
-        geometry = map_preview.history_geometry(self.preview_track or {})
-        for first, second, color in geometry["segments"]:
-            previous = map_preview.screen_position(first, center, zoom, width, height)
-            current = map_preview.screen_position(second, center, zoom, width, height)
-            self.canvas.create_line(*previous, *current, fill=color, width=3, tags="route")
-        for index, point in enumerate(self.points, 1):
-            px, py = map_preview.screen_position((point["glat"], point["glon"]), center, zoom, width, height)
-            self.canvas.create_oval(px - 12, py - 12, px + 12, py + 12, fill="#bb7412", outline="white", width=2, tags="checkpoint")
-            self.canvas.create_text(px, py, text=str(index), fill="white", font=("Microsoft YaHei UI", 9, "bold"), tags="checkpoint")
-        for coordinate, text, color, shift in ((geometry["start"], "起", "#157448", -23),
-                                                (geometry["end"], "终", "#b13946", 23)):
-            if coordinate is not None:
-                x, y = map_preview.screen_position(coordinate, center, zoom, width, height)
-                self.canvas.create_rectangle(x - 10 + shift, y - 10, x + 10 + shift, y + 10, fill=color, outline="white", tags="endpoints")
-                self.canvas.create_text(x + shift, y, text=text, fill="white", tags="endpoints")
+        """按 Canvas 版原样式绘制：绿方块"起"、红方块"终"、橙圆+编号打卡点。"""
+        import traceback
+        try:
+            if self.map_widget is None:
+                return
+
+            # 清除旧轨迹与标记
+            for attr in ("track_path", "start_marker", "end_marker"):
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    try:
+                        obj.delete()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
+            for attr in ("checkpoint_markers", "point_markers"):
+                for m in getattr(self, attr, []) or []:
+                    try:
+                        m.delete()
+                    except Exception:
+                        pass
+                setattr(self, attr, [])
+
+            # ── 轨迹折线 ──
+            coords = []
+            if self.preview_track:
+                for i, p in enumerate(self.preview_track.get("locations", []) or []):
+                    if p.get("type") == -1:
+                        continue
+                    try:
+                        glat, glng = bd09_to_gcj02(p["gLat"], p["gLng"])
+                        coords.append((glat, glng))
+                    except Exception as e:
+                        print(f"[draw_points] 点 {i} 坐标转换失败: {e}", flush=True)
+
+            print(f"[draw_points] coords 数量={len(coords)}", flush=True)
+            if coords:
+                self.track_path = self.map_widget.set_path(
+                    coords, color="#00c18b", width=3
+                )
+                lats = [c[0] for c in coords]
+                lngs = [c[1] for c in coords]
+                self.map_widget.set_position((min(lats) + max(lats)) / 2,
+                                             (min(lngs) + max(lngs)) / 2)
+                span = max(max(lats) - min(lats), max(lngs) - min(lngs))
+                if span > 0.05:
+                    zoom = 13
+                elif span > 0.02:
+                    zoom = 14
+                elif span > 0.01:
+                    zoom = 15
+                elif span > 0.005:
+                    zoom = 16
+                else:
+                    zoom = 17
+                self.map_widget.set_zoom(zoom)
+
+            # ── 打卡点：橙色实心圆 + 白色编号 ──
+            for index, point in enumerate(self.points, 1):
+                lat, lng = point["glat"], point["glon"]
+                icon = self._make_circle_icon(
+                    "#bb7412", size=28, outline="#ffffff",
+                    outline_width=2, text=str(index)
+                )
+                m = self.map_widget.set_marker(lat, lng, icon=icon)
+                self.checkpoint_markers.append(m)
+            print(f"[draw_points] 打卡点 {len(self.checkpoint_markers)} 个", flush=True)
+
+            # ── 起点：绿方块"起" / 终点：红方块"终" ──
+            if coords:
+                start_icon = self._make_square_icon(
+                    "#157448", size=26, outline="#ffffff",
+                    outline_width=2, text="起"
+                )
+                end_icon = self._make_square_icon(
+                    "#b13946", size=26, outline="#ffffff",
+                    outline_width=2, text="终"
+                )
+                self.start_marker = self.map_widget.set_marker(
+                    coords[0][0], coords[0][1], icon=start_icon
+                )
+                self.end_marker = self.map_widget.set_marker(
+                    coords[-1][0], coords[-1][1], icon=end_icon
+                )
+                print("[draw_points] 起终点完成", flush=True)
+        except Exception:
+            print("[draw_points] 顶层异常：", flush=True)
+            traceback.print_exc()
 
     def add_tooltip(self, widget, text):
-        """为缩放符号提供简短的悬停说明。"""
         popup = []
 
         def leave(event=None):
-            """离开按钮后销毁本按钮的提示窗口。"""
             if popup:
                 popup.pop().destroy()
 
         def enter(event=None):
-            """在按钮下方显示说明，不改变主窗口布局。"""
             leave()
             tip = tk.Toplevel(widget)
             tip.wm_overrideredirect(True)
@@ -563,55 +681,56 @@ class App:
         widget.bind("<Leave>", leave)
 
     def fit_map(self):
-        """把全部轨迹和打卡点放入视野，旧底图失效但不自动发请求。"""
+        """适配所有点位和轨迹。"""
+        if self.map_widget is None:
+            return
         coords = [(p["glat"], p["glon"]) for p in self.points]
         if self.preview_track:
-            coords.extend(p for p in map_preview.track_coordinates(self.preview_track) if p)
-        self.map_view = map_preview.fit_view(coords, max(320, self.canvas.winfo_width()), max(160, self.canvas.winfo_height()))
-        self.map_background = None
-        self.map_status.set("GCJ-02 / 底图未加载")
+            for p in self.preview_track.get("locations", []):
+                if p.get("type") == -1:
+                    continue
+                try:
+                    glat, glng = bd09_to_gcj02(p["gLat"], p["gLng"])
+                    coords.append((glat, glng))
+                except Exception:
+                    pass
+        if not coords:
+            return
+        lats = [c[0] for c in coords]
+        lngs = [c[1] for c in coords]
+        self.map_widget.set_position((min(lats) + max(lats)) / 2,
+                                     (min(lngs) + max(lngs)) / 2)
+        span = max(max(lats) - min(lats), max(lngs) - min(lngs))
+        if span > 0.05:
+            zoom = 13
+        elif span > 0.02:
+            zoom = 14
+        elif span > 0.01:
+            zoom = 15
+        elif span > 0.005:
+            zoom = 16
+        else:
+            zoom = 17
+        self.map_widget.set_zoom(zoom)
+        self.map_status.set("GCJ-02 / 高德瓦片 / 缩放 {}".format(zoom))
         self.draw_points()
 
     def change_zoom(self, delta):
-        """改变地图缩放并清除旧底图，配置 Key 时重新加载。"""
-        if self.map_view is None or self.busy:
+        if self.map_widget is None or self.busy:
             return
-        center, zoom = self.map_view
-        self.map_view = center, max(1, min(17, zoom + delta))
-        self.map_background = None
-        self.map_status.set("GCJ-02 / 缩放 {} / 底图未加载".format(self.map_view[1]))
-        self.draw_points()
-        if self.has_amap_key:
-            self.load_map()
+        try:
+            current = self.map_widget.zoom
+        except Exception:
+            current = 16
+        new_zoom = max(1, min(19, current + delta))
+        self.map_widget.set_zoom(new_zoom)
+        self.map_status.set("GCJ-02 / 高德瓦片 / 缩放 {}".format(new_zoom))
 
     def load_map(self):
-        """请求当前视野的底图；不读表单密码、不发送轨迹。"""
-        if self.map_view is None or self.busy:
-            return
-        view = self.map_view
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        self.map_status.set("高德底图加载中…")
-
-        def fetch():
-            """后台获取图片，把底图失败当成可恢复的预览状态。"""
-            try:
-                return view, map_preview.fetch_background(*view, width, height), None
-            except (ValueError, OSError) as exc:
-                return view, None, str(exc)
-
-        self.start_job("加载地图底图", fetch, self.map_loaded)
-
-    def map_loaded(self, result):
-        """只使用与当前中心和缩放一致的图片，失败时保留轨迹。"""
-        view, image, error = result
-        if view != self.map_view:
-            return
-        self.map_background = image
-        self.map_status.set(error or "高德地图 / GCJ-02 / 缩放 {}".format(view[1]))
-        self.draw_points()
+        """tkintermapview 自动加载瓦片，只需重绘。"""
+        self.fit_map()
 
     def invalidate_plan(self, *args):
-        """参数或设置变化后废弃旧方案，避免提交与用户看到的参数不符。"""
         had_plan = self.plan is not None
         self.plan = None
         self.preview_parameters = None
@@ -625,13 +744,11 @@ class App:
         self.refresh_submit_state()
 
     def refresh_submit_state(self):
-        """只有未使用的在线方案且没有后台任务时才允许确认提交。"""
         ready = (self.plan is not None and not self.plan.attempted and not self.busy
                  and not self.plan.data().get("preview_only"))
         self.submit_button.configure(state="normal" if ready else "disabled")
 
     def generate_preview(self):
-        """校验表单后生成冻结方案，过程不提交运动记录。"""
         from .api.flow import prepare_run_plan
         try:
             params = services.run_parameters(self.values(self.run_vars))
@@ -639,11 +756,11 @@ class App:
             self.show_error(str(exc))
             return
         self.invalidate_plan()
-        self.start_job("生成在线方案预览", lambda: services.with_client(lambda client: prepare_run_plan(client, **params)),
+        self.start_job("生成在线方案预览",
+                       lambda: services.with_client(lambda client: prepare_run_plan(client, **params)),
                        lambda plan: self.show_plan(plan, params))
 
     def generate_route_preview(self):
-        """使用手动参数、缓存点位和高德路线预览，不访问运动服务。"""
         from .api.flow import prepare_route_preview
         self.run_vars["auto"].set(False)
         self.run_vars["use_map"].set(True)
@@ -656,11 +773,11 @@ class App:
         local_params = {key: value for key, value in params.items()
                         if key in ("dist", "pace", "cadence", "start_ms", "before", "seed")}
         self.invalidate_plan()
-        self.start_job("生成高德轨迹预览", lambda: services.with_client(lambda client: prepare_route_preview(client, **local_params)),
+        self.start_job("生成高德轨迹预览",
+                       lambda: services.with_client(lambda client: prepare_route_preview(client, **local_params)),
                        lambda plan: self.show_plan(plan, params))
 
     def show_plan(self, plan, parameters):
-        """展示已冻结的实际方案与各点最近采样距离，保留相同实例待提交。"""
         data = plan.data()
         self.plan = plan
         self.preview_parameters = dict(parameters)
@@ -680,14 +797,11 @@ class App:
                         "有效时段内" if data["window_ok"] else "有效时段外")
         self.plan_status.set("方案 {}\n{:.0f} m / {} s / {}".format(plan.plan_id, data["track"]["totalDistance"],
             data["track"]["totalTime"], window_label))
-        self.fit_map()
         self.preview_tabs.select(0)
+        self.fit_map()
         self.refresh_submit_state()
-        if self.has_amap_key and not data.get("preview_only"):
-            self.root.after_idle(self.load_map)
 
     def submit_run(self):
-        """确认后只提交当前预览快照，时间外测试需要明确开启。"""
         from .api.flow import submit_run_plan
         if self.plan is None:
             self.show_error("请先生成并检查方案预览")
@@ -715,10 +829,10 @@ class App:
                                    "\n\n将提交当前预览数据，不能在这里撤销。继续？", parent=self.root):
             return
         self.start_job("提交方案 " + plan.plan_id,
-                       lambda: services.with_client(lambda client: submit_run_plan(client, plan, outside)), self.run_done)
+                       lambda: services.with_client(lambda client: submit_run_plan(client, plan, outside)),
+                       self.run_done)
 
     def run_done(self, result):
-        """分别展示提交、OBS、详情读取和打卡字段状态，不混称全部成功。"""
         self.rrid.set(str(result["rrid"]))
         summary = "记录 ID：{}\n距离：{:.0f} m\n时长：{} s\nOBS 上传：{}/2\n详情读取：{}\n".format(
             result["rrid"], result["dist"], result["dur"], result["obs_ok"], "成功" if result["detail_ok"] else "失败")
@@ -732,12 +846,10 @@ class App:
         self.append_log("提交阶段已结束，请查看记录与诊断；勿因显示缺失重复提交。")
 
     def load_records(self):
-        """后台查询当前账号的跑步记录列表。"""
         from .api.records import fetch_records
         self.start_job("刷新记录", lambda: services.with_client(fetch_records), self.show_records)
 
     def show_records(self, rows):
-        """按固定列显示记录，未知达标状态不显示成通过。"""
         self.record_tree.delete(*self.record_tree.get_children())
         for record in rows:
             stamp = datetime.fromtimestamp(record["start_time"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -747,13 +859,11 @@ class App:
         self.status.set("已读取 {} 条记录".format(len(rows)))
 
     def select_record(self, event=None):
-        """将所选记录的 ID 带入查询框，选择本身不发请求。"""
         selected = self.record_tree.selection()
         if selected:
             self.rrid.set(str(self.record_tree.item(selected[0], "values")[-1]))
 
     def diagnose_record(self):
-        """查询用户指定的记录详情，并报告打卡字段是否可见。"""
         try:
             rrid = services.number(self.rrid.get(), "记录 ID", 1, 2 ** 53 - 1, True)
         except ValueError as exc:
@@ -762,33 +872,27 @@ class App:
         self.start_job("查询记录详情", lambda: services.fetch_record_report(rrid), self.show_diagnostic)
 
     def open_diagnostic(self):
-        """让用户主动选择本地 JSON；不扫描数据目录、不上传文件。"""
         filename = filedialog.askopenfilename(parent=self.root, title="打开本地记录或 OBS JSON",
                                                filetypes=[("JSON", "*.json")])
         if filename:
             self.start_job("离线诊断", lambda: inspect_file(filename), self.show_diagnostic)
 
     def show_diagnostic(self, report):
-        """显示只读诊断结果。"""
         self.set_report(format_report(report))
 
     def set_report(self, text):
-        """替换诊断区内容并回到顶部。"""
         self.set_text(self.report_text, text)
 
     def set_text(self, widget, text):
-        """安全更新只读文本框。"""
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", services.safe_text(text, self.secrets))
         widget.configure(state="disabled")
 
     def query_data(self):
-        """执行下拉列表中选中的只读业务查询。"""
         kind = self.query_kind.get()
 
         def query(client):
-            """仅提取所需字段，避免把整个个人资料响应写入界面。"""
             if kind == "学校跑步策略":
                 from .api.policy import fetch_policy
                 policy = fetch_policy(client)
@@ -809,11 +913,15 @@ class App:
         self.start_job("查询" + kind, lambda: services.with_client(query), lambda text: self.set_text(self.tools_text, text))
 
     def close(self):
-        """避免提交中途退出造成不明状态，关闭时恢复原日志处理器。"""
         if self.busy:
             messagebox.showinfo("任务正在运行", "请等待当前任务结束后关闭，避免无法确认提交结果。", parent=self.root)
             return
         self.root.after_cancel(self.poll_id)
+        if self.map_widget is not None:
+            try:
+                self.map_widget.destroy()
+            except Exception:
+                pass
         log.handlers = self.old_handlers
         self.log_handler.close()
         self.root.destroy()
