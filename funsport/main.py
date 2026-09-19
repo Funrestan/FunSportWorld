@@ -6,10 +6,26 @@ from .logger import err
 from .cli import cmds, init_cmd
 
 
-def main():
+def cmd_gui(args=None):
+    """延迟导入 Tkinter，让有参数的 CLI 在无桌面环境下仍能运行。"""
+    from .gui import launch
+    launch()
+
+
+def cmd_help(args=None):
+    """显示已有命令摘要，不启动 GUI。"""
+    from .cli.mod import usage
+    usage()
+
+
+def main(argv=None):
+    """有参数时运行 CLI，无参数或 gui 子命令时打开桌面窗口。"""
     p = argparse.ArgumentParser(prog="funsport",
                                 description="FunSportWorld - 校园运动自动化")
     sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("gui", help="打开桌面 GUI").set_defaults(func=cmd_gui)
+    sub.add_parser("help", help="显示命令摘要").set_defaults(func=cmd_help)
 
     # ── init ────────────────────────────────────────────────
     sp = sub.add_parser("init", help="一次性初始化（账号/城市/坐标/高德Key/设备）")
@@ -77,10 +93,11 @@ def main():
     sp.add_argument("--before", type=int, default=0,
                     help="提交时间提前 N 分钟（覆盖 config；默认走 config 范围随机）")
     sp.add_argument("--allow-outside", action="store_true",
-                    help="允许在有效时间窗口外提交（跳过校验）")
+                    help="仅跳过本地时间检查，不能绕过服务端 11016")
     sp.add_argument("--face", action="store_true", default=True)
     sp.add_argument("--seed", type=int, default=0)
-    sp.add_argument("--use-map", action="store_true")
+    sp.add_argument("--use-map", action="store_true", default=True,
+                    help="兼容参数；生成轨迹始终使用高德步行 API")
     sp.set_defaults(func=cmds.cmd_run)
 
     # ── AI ──────────────────────────────────────────────────
@@ -124,14 +141,12 @@ def main():
     sp.add_argument("--range", type=int)
     sp.set_defaults(func=cmds.cmd_rank)
 
-    args = p.parse_args()
-    if not args.cmd:
-        from .cli.mod import usage
-        usage()
-        return
-
+    args = p.parse_args(argv)
     try:
-        args.func(args)
+        if not args.cmd:
+            cmd_gui()
+        else:
+            args.func(args)
     except KeyboardInterrupt:
         err("用户中断")
     except Exception as e:

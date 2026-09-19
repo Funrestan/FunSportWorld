@@ -1,6 +1,7 @@
 """HTTP 客户端。"""
 import json
 import requests
+from .errors import BusinessError
 
 from ..crypto.envelope import EnvelopeSession, build_envelope
 from ..crypto.decrypt import derive_paes_key
@@ -25,6 +26,7 @@ class ApiClient:
         return self.session_data["token"] if self.session_data else ""
 
     def call(self, method, path, body_plain="{}", host=None, extra_headers=None):
+        """发送现有协议请求；日志只记录元数据，不输出凭据或业务响应。"""
         host = host or HOST
         url = host + path
         extra_headers = extra_headers or []
@@ -44,7 +46,7 @@ class ApiClient:
         for k, v in extra_headers:
             headers[k] = v
 
-        log.info(f"→ {method} {path} body={body_plain[:100]}")
+        log.info(f"→ {method} {path.split('?')[0]}")
         try:
             resp = self.http.request(method, url, data=body_env.json,
                                      headers=headers, timeout=30)
@@ -61,7 +63,8 @@ class ApiClient:
         err_code = biz.get("error", 0)
         if err_code != 10000:
             msg = biz.get("message") or biz.get("msg") or "(无消息)"
-            err(f"业务错误 {err_code}: {msg}")
-            raise RuntimeError(f"业务错误 {err_code}: {msg}")
-        dim(f"响应: {json.dumps(biz, ensure_ascii=False)[:200]}")
+            problem = BusinessError(err_code, msg, path)
+            err(str(problem))
+            raise problem
+        dim(f"响应业务码: {err_code}")
         return biz

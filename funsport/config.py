@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 import random
+import tempfile
 from pathlib import Path
 
 HOST = "https://run.gxapp.iydsj.com"
@@ -55,7 +56,21 @@ def load_json(path: Path, default=None):
 
 
 def save_json(path: Path, obj):
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    """先完整写入同目录临时文件，再原子替换，避免配置只写了一半。"""
+    path = Path(path)
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 # ── 设备身份 ────────────────────────────────────────────────
@@ -210,14 +225,19 @@ def set_config(**kwargs):
 
 
 # ── 缓存 ────────────────────────────────────────────────────
-def load_points_cache():
+def load_points_cache(with_metadata=False):
+    """兼容旧缓存读取，并按需返回点位、跑区信息和所属账号上下文。"""
     v = load_json(POINTS_CACHE)
-    if not v:
+    if not isinstance(v, dict) or not v:
         return None
+    if with_metadata:
+        return v
     return v.get("ts"), v.get("points", [])
 
-def save_points_cache(points):
-    save_json(POINTS_CACHE, {"ts": int(time.time() * 1000), "points": points})
+def save_points_cache(points, metadata=None, context=None):
+    """同时缓存点位和原始跑区信息，避免下一次序列化丢失元数据。"""
+    save_json(POINTS_CACHE, {"ts": int(time.time() * 1000), "points": points,
+                             "metadata": metadata or {}, "context": context})
 
 
 def load_ai_sports():

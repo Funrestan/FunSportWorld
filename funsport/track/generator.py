@@ -8,6 +8,7 @@ from ..logger import log, ok, dim
 
 
 def fit_speeds(w, dts, target):
+    """在速度上下限内迭代匹配目标里程，原地更新每段速度。"""
     for _ in range(24):
         cur = sum(x * dt for x, dt in zip(w, dts))
         if abs(cur - target) <= 1.0:
@@ -20,6 +21,7 @@ def fit_speeds(w, dts, target):
 
 
 def _make_dips(rng, dur):
+    """生成速度曲线的缓慢降速区间，不代表App暂停事件。"""
     dips = []
     for _ in range(rng.choice([1, 1, 2])):
         dips.append((rng.uniform(0.15, 0.75) * dur,
@@ -28,6 +30,7 @@ def _make_dips(rng, dur):
 
 
 def _dip_factor(tt, dips):
+    """计算指定时刻在平滑降速区间中的速度倍率。"""
     f = 1.0
     for c, hw, d in dips:
         if abs(tt - c) < hw:
@@ -37,7 +40,7 @@ def _dip_factor(tt, dips):
 
 def build(dist, dur, seed, start_ms, points_bd,
           ordered_path=False, cadence_target=0):
-    """生成轨迹。
+    """沿路径生成轨迹；有序规划不随机伪造无效、越界或打卡点类型。
 
     cadence_target: 目标步频 spm（0 = 自动按速度推算）
     """
@@ -48,8 +51,12 @@ def build(dist, dur, seed, start_ms, points_bd,
 
     dense, arcs, (c_lat, c_lng) = make_point_ring(points_bd, ordered=ordered_path)
     ring_len = arcs[-1] if arcs else 0.0
+    if ring_len <= 0 or dur <= 0 or dist <= 0:
+        raise ValueError("路线长度、目标里程和时长必须为正数")
 
     if ordered_path:
+        if not SPEED_FLOOR <= dist / dur <= SPEED_CEIL:
+            raise ValueError("规划里程与时长超出生成器的速度范围")
         direction = 1.0
         s0 = 0.0
         s_limit = dist
@@ -95,10 +102,16 @@ def build(dist, dur, seed, start_ms, points_bd,
     dts = [times[i + 1] - times[i] for i in range(n_max - 1)]
     dts.append(max(1.0, dur - times[-1]))
     fit_speeds(w, dts, dist)
+    if ordered_path and abs(sum(speed * dt for speed, dt in zip(w, dts)) - dist) > 1.0:
+        raise ValueError("速度拟合未达到规划里程，停止生成不完整路线")
     dim(f"速度拟合：{n_max} 点 平均 {dist/dur:.2f} m/s")
 
     kinds = []
     for _ in range(n_max):
+        if ordered_path:
+            # 规划折线没有真实定位异常或打卡事件，普通点必须使用type=0。
+            kinds.append((0, 1))
+            continue
         u = rng.random()
         if u < 0.39:
             kinds.append((3, 1))
@@ -129,6 +142,8 @@ def build(dist, dur, seed, start_ms, points_bd,
         d_step = 0.0
         if typ != -1:
             d_step = w[i] * dt
+            if ordered_path and i == n_max - 1:
+                d_step = max(0.0, s_limit - (s - s0))
             if ordered_path and (s - s0 + d_step) > s_limit:
                 d_step = max(0.0, s_limit - (s - s0))
             s += direction * d_step
@@ -202,7 +217,7 @@ def build(dist, dur, seed, start_ms, points_bd,
             break
 
     from .postfix import apply_post_fixes
-    apply_post_fixes(locs, rng, start_ms)
+    apply_post_fixes(locs, rng, start_ms, ordered_path=ordered_path)
 
     snap_radius = 20.0 if ordered_path else 40.0
     for pl in points_bd:
@@ -221,7 +236,10 @@ def build(dist, dur, seed, start_ms, points_bd,
     n_used = len(locs)
     for i in range(n_used):
         ten_t += dts[i] if i < len(dts) else 0.0
-        ten_d += w[i] * (dts[i] if i < len(dts) else 0.0)
+        if ordered_path:
+            ten_d += locs[i]["totalDis"] - (locs[i - 1]["totalDis"] if i else 0.0)
+        else:
+            ten_d += w[i] * (dts[i] if i < len(dts) else 0.0)
         ten_st += (locs[i]["steps"] - (locs[i - 1]["steps"] if i else 0))
         while ten_t >= 10.0:
             k = 10.0 / ten_t
@@ -231,13 +249,31 @@ def build(dist, dur, seed, start_ms, points_bd,
             ten_t -= 10.0
             ten_d -= out_d
             ten_st -= out_st
-    if ten_t > 1.0:
+    if ordered_path and ten_t > 0:
+        speed_win.append({"time": ten_t, "value": round_to(ten_d, 2)})
+        steps_win.append({"time": ten_t, "value": round_to(ten_st, 0)})
+    elif ten_t > 1.0:
         k = min(10.0 / ten_t, 1.4)
         speed_win.append({"time": 10, "value": round_to(ten_d * k, 2)})
         steps_win.append({"time": 10, "value": round_to(ten_st * k, 0)})
 
     total_dis_actual = dist_acc
     total_t_actual = int(round(t_acc))
+    if ordered_path and locs:
+        # 起点单独占用t=0；终点沿路径采样，不直接拉一条线回起点。
+        end_x, end_y = ring_point_at(dense, arcs, s - s0)
+        end_lat, end_lng = to_bd(end_x, end_y, c_lat, c_lng)
+        locs[-1]["gLat"], locs[-1]["gLng"] = round_to(end_lat, 7), round_to(end_lng, 7)
+        start_point = dict(locs[0])
+        start_point.update({"gLat": round_to(points_bd[0][0], 7),
+                            "gLng": round_to(points_bd[0][1], 7),
+                            "type": 5, "state": 1, "totalTime": 0, "validTime": 0,
+                            "totalDis": 0.0, "validDis": 0.0, "steps": 0,
+                            "speed": 0.0, "avgSpeed": 0.0, "bdS": 0.0,
+                            "gainTime": fmt_gain_time(start_ms), "gainTimeMs": start_ms})
+        locs.insert(0, start_point)
+        for index, point in enumerate(locs, 1):
+            point["id"] = index
     track = {
         "totalTime": total_t_actual,
         "totalDistance": round_to(total_dis_actual, 3),

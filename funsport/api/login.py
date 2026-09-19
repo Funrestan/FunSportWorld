@@ -5,6 +5,7 @@ import time
 import uuid
 
 from .gt4 import solve_gt4
+from .errors import BusinessError
 from ..config import HOST, save_session, clear_session
 from ..crypto.decrypt import parse_data_field, get_field, decrypt_response, derive_paes_key
 from ..crypto.header import build_ios_header, UA_IOS
@@ -132,10 +133,25 @@ def login(client, username, password):
 
 
 def logout(client):
-    if client.session_data:
-        try:
-            client.call("POST", LOGOUT_PATH, "{}")
-        except Exception:
-            pass
+    """使用当前会话请求服务器退出；确认成功才清理本地，失败保留凭据。"""
+    session = client.session_data or {}
+    if not session.get("uid") or not session.get("token"):
+        raise ValueError("没有可用会话，无法请求服务器退出；未执行本地清理")
+    try:
+        response = client.call("POST", LOGOUT_PATH, "{}")
+    except BusinessError as exc:
+        raise BusinessError(exc.code, "服务器拒绝退出；本地会话已保留，不能视为退出成功", LOGOUT_PATH) from None
+    except Exception:
+        raise RuntimeError("退出请求失败或响应无法验证；服务器是否退出未知，本地会话已保留。请检查网络后重试退出。") from None
+    if not isinstance(response, dict) or response.get("error") != 10000:
+        raise RuntimeError("退出响应未确认成功；本地会话已保留，不能视为退出成功")
+    client.session_data = None
+    try:
         clear_session()
-        ok("已登出")
+    except OSError:
+        message = "服务器已确认退出，但本地会话文件清理失败；请检查文件权限，不要继续使用旧会话。"
+        warn(message)
+        return {"local_cleared": False, "message": message}
+    message = "服务器已确认退出，本地会话已清除"
+    ok(message)
+    return {"local_cleared": True, "message": message}

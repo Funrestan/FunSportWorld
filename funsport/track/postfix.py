@@ -2,7 +2,12 @@
 from .geom import round_to, fmt_gain_time, SPEED_FLOOR, SPEED_CEIL
 
 
-def apply_post_fixes(locs, rng, start_ms):
+def apply_post_fixes(locs, rng, start_ms, ordered_path=False):
+    """有序规划只标终点；旧拟合模式保留原后处理，不伪造规划段的事件。"""
+    if ordered_path:
+        if locs:
+            locs[-1]["type"] = 6
+        return
     if len(locs) >= 4:
         ci = len(locs) - 1
         while ci > 0 and locs[ci]["type"] == -1:

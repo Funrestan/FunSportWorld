@@ -59,11 +59,18 @@ def cmd_login(args):
 
 
 def cmd_logout(args):
+    """请求服务器退出并释放连接；失败保留会话并让 CLI 返回错误。"""
     from ..api import login as api_login
-    identity = load_identity()
     sess = load_session()
-    client = ApiClient(identity, sess if sess.get("uid") else None)
-    api_login.logout(client)
+    if not sess.get("uid") or not sess.get("token"):
+        raise ValueError("没有可用会话，无法请求服务器退出；未执行本地清理")
+    client = ApiClient(load_identity(), sess)
+    try:
+        result = api_login.logout(client)
+        if not result["local_cleared"]:
+            raise RuntimeError(result["message"])
+    finally:
+        client.http.close()
 
 
 # ── points / policy ────────────────────────────────────────
@@ -127,6 +134,7 @@ def cmd_config(args):
 
 # ── run ─────────────────────────────────────────────────────
 def cmd_run(args):
+    """运行现有跑步链，并区分提交完成与详情、打卡点检查状态。"""
     from ..api import flow
     client = make_client()
 
@@ -168,10 +176,11 @@ def cmd_run(args):
         allow_outside_window=allow_outside,
     )
     print()
-    ok(f"跑步成功 rrid={result['rrid']} uuid={result['uuid']}")
+    ok(f"记录已提交 rrid={result['rrid']} uuid={result['uuid']}")
     ok(f"距离 {result['dist']:.0f}m / 时长 {result['dur']}s / "
        f"平均步频 {result['cadence_avg']:.0f}spm")
-    ok(f"OBS {result['obs_ok']}/2 · 验证 {'通过' if result['detail_ok'] else '未通过'}")
+    info(f"OBS {result['obs_ok']}/2 · 详情读取 {'成功' if result['detail_ok'] else '失败'}")
+    info("打卡点是否显示仍需以官方 App 为准，详情读取成功不代表打卡验证通过")
 
 
 # ── AI ──────────────────────────────────────────────────────
