@@ -1,9 +1,12 @@
 """OBS 上传。"""
 import json
 import requests
+import time
+from urllib.parse import urlsplit
 
 from ..crypto.decrypt import parse_data_field, get_field
 from ..logger import log, ok, warn
+from ..run_diagnostics import current_archive
 
 OBS_SIGN_PATH = "/api/obs/temporary/url"
 
@@ -28,10 +31,35 @@ def sign_url(client, method, key):
 
 
 def put_object(signed_url, payload):
-    r = requests.put(signed_url, data=payload,
-                     headers={"Content-Type": "application/json"}, timeout=60)
-    r.raise_for_status()
-    log.info(f"[obs] PUT -> {r.status_code}")
+    archive = current_archive()
+    started = time.monotonic()
+    parts = urlsplit(signed_url)
+    path = "{}{}".format(parts.netloc, parts.path)
+    try:
+        request_body = json.loads(payload.decode("utf-8"))
+    except (AttributeError, UnicodeError, ValueError):
+        request_body = {"bytes": len(payload)}
+    try:
+        r = requests.put(signed_url, data=payload,
+                         headers={"Content-Type": "application/json"}, timeout=60)
+        if archive:
+            try:
+                response_body = r.text[:16000]
+            except Exception:
+                response_body = {"bytes": len(r.content)}
+            archive.record_message("obs-upload", "PUT", path, request=request_body,
+                                   response={"body": response_body, "bytes": len(r.content)},
+                                   status=r.status_code,
+                                   error="HTTP {}".format(r.status_code) if r.status_code >= 400 else None,
+                                   duration_ms=round((time.monotonic() - started) * 1000))
+        r.raise_for_status()
+        log.info(f"[obs] PUT -> {r.status_code}")
+    except requests.RequestException as exc:
+        if archive and "r" not in locals():
+            archive.record_message("obs-upload", "PUT", path, request=request_body,
+                                   error=str(exc),
+                                   duration_ms=round((time.monotonic() - started) * 1000))
+        raise
 
 
 def upload_both_keys(client, keys, payload):

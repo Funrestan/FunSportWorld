@@ -1,12 +1,14 @@
 """高德路线返回、闭合和缓存的隔离验证，不请求真实 Key 或服务。"""
 import time
 import copy
+import json
 from unittest.mock import MagicMock, patch
 import requests
 
 from tests.support import IsolatedCase
 from tests.plan_fixture import sample_ring
 from funsport import config
+from funsport.run_diagnostics import RunDiagnosticArchive
 from funsport.api import campus_loop as loop, flow
 from funsport.coordinates import checkpoint_coordinates, gcj02_to_bd09
 
@@ -28,6 +30,7 @@ class CampusLoopTests(IsolatedCase):
         """创建带资源关闭语义的 HTTP 模拟响应。"""
         response = MagicMock()
         response.__enter__.return_value = response
+        response.status_code = 200
         response.json.return_value = data
         return response
 
@@ -68,6 +71,19 @@ class CampusLoopTests(IsolatedCase):
         self.assertEqual(get.call_args_list[0].kwargs["params"]["alternative_route"], 3)
         first.__exit__.assert_called_once()
         second.__exit__.assert_called_once()
+
+    def test_amap_exchange_is_archived_without_key(self):
+        first = self.response({"status": "0"})
+        second = self.response(self.payload([{"polyline": "104.1,30.6;104.101,30.601"}]))
+        archive = RunDiagnosticArchive("amap-test")
+        with archive.active(), patch.object(loop.requests, "get", side_effect=[first, second]):
+            loop._amap_walking((30.6, 104.1), (30.601, 104.101), "fixture-key")
+
+        messages = json.loads((archive.directory / "communication.json").read_text(encoding="utf-8"))["messages"]
+        self.assertEqual([message["phase"] for message in messages], ["amap-route", "amap-route"])
+        self.assertNotIn("fixture-key", json.dumps(messages))
+        self.assertEqual(messages[1]["request"]["params"]["origin"], "104.1,30.6")
+        self.assertEqual(messages[1]["response"]["route"]["paths"][0]["distance"], "1000")
 
     def test_amap_failure_does_not_expose_key(self):
         """网络错误即使包含 Key，也只能向用户返回固定安全消息。"""

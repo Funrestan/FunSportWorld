@@ -3,6 +3,7 @@ import json
 import math
 import random
 import time
+from contextlib import nullcontext
 from datetime import datetime, time as dtime, timedelta
 
 from . import policy as api_policy
@@ -13,9 +14,11 @@ from . import records as api_records
 from . import campus_loop as api_loop
 from ..config import load_config, load_points_cache
 from ..coordinates import coordinate_report
-from ..diagnostics import analyze_checkpoints, format_report
+from ..diagnostics import analyze_run_checkpoints, format_report
+from ..completion import evaluate_completion
 from ..run_plan import RunPlan, checkpoint_distances, prepare_checkpoint_order
 from ..track import generator, wire
+from ..track.checkpoints import evaluate_checkpoints
 from ..track.geom import MET_PER_DEG_LAT, MET_PER_DEG_LNG, SPEED_FLOOR, SPEED_CEIL
 from ..logger import log, ok, warn, step, err
 
@@ -186,7 +189,43 @@ def _build_amap_track(points, dist_m, pace_s, cadence, seed, start_ms):
                    "complete_laps": int((track["totalDistance"] + 0.01) // ring_len), **selection}
 
 
-def prepare_run_plan(client, dist=0, pace=0, cadence=0, start_ms=0,
+def prepare_run_plan(client, *args, diagnostic_capture=False, **kwargs):
+    """Create an online plan, optionally journaling its complete network exchange."""
+    if not diagnostic_capture:
+        return _prepare_run_plan_impl(client, *args, **kwargs)
+    from ..run_diagnostics import RunDiagnosticArchive
+
+    try:
+        diagnostics = RunDiagnosticArchive()
+    except OSError as exc:
+        warn("无法创建本地通信诊断包，继续预览：{}".format(exc))
+        return _prepare_run_plan_impl(client, *args, **kwargs)
+    handler = diagnostics.attach(log)
+    try:
+        with diagnostics.active():
+            plan = _prepare_run_plan_impl(client, *args, **kwargs)
+        data = plan.data()
+        data["diagnostic_dir"] = str(diagnostics.directory)
+        plan = RunPlan.create(client, data)
+        diagnostics.capture_plan(data, plan.plan_id)
+        diagnostics.capture("manifest.json", {
+            "createdAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "planId": plan.plan_id,
+            "status": "preview_ready",
+        })
+        return plan
+    except Exception as exc:
+        diagnostics.capture("failure.json", {"stage": "preview", "error": str(exc)})
+        diagnostics.capture("manifest.json", {
+            "createdAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "status": "preview_failed",
+        })
+        raise
+    finally:
+        log.removeHandler(handler)
+
+
+def _prepare_run_plan_impl(client, dist=0, pace=0, cadence=0, start_ms=0,
                   face_check=1, seed=0, use_map=True, auto=False,
                   dist_min=None, dist_max=None,
                   pace_min=None, pace_max=None,
@@ -240,8 +279,16 @@ def prepare_run_plan(client, dist=0, pace=0, cadence=0, start_ms=0,
     if seed == 0:
         seed = random.SystemRandom().randrange(1, 2_147_483_648)
     track, route = _build_amap_track(pts, dist_m, pace_s, cadence_spm, seed, start_ms)
-
+    track, pts, checkpoint_evaluation = evaluate_checkpoints(
+        track, pts, pol.policy, point_metadata,
+        geo_fence=getattr(pol, "geo_fence", None),
+        run_area_models=getattr(pol, "run_area_models", None),
+    )
+    run_rules = getattr(pol, "run_rules", {})
+    completion = evaluate_completion(track, pts, pol.policy, pol.min_distance, run_rules)
     five = wire.five_point_wrapper(pts, track["startTime"], point_metadata)
+    log.info("本地模拟判点：{}/{}；顺序完成={}；原生定位校验未复现".format(
+        checkpoint_evaluation["passed_count"], len(pts), checkpoint_evaluation["all_passed"]))
 
     # 地图环扩展及生成器修正会改变时长，必须用最终轨迹检查窗口。
     ok_win, reason = _check_time_window(track["startTime"], track["totalTime"], pol.valid_time)
@@ -254,6 +301,8 @@ def prepare_run_plan(client, dist=0, pace=0, cadence=0, start_ms=0,
         "checkpoint_distances": checkpoint_distances(track, pts),
         "coordinate_report": coordinates,
         "checkpoint_order": checkpoint_order,
+        "checkpoint_evaluation": checkpoint_evaluation,
+        "run_rules": run_rules, "completion": completion,
     })
     ok("方案 {} 已生成，尚未提交；{}".format(plan.plan_id, reason))
     return plan
@@ -295,11 +344,17 @@ def prepare_route_preview(client, dist, pace, cadence, start_ms=0, before=0, see
     return plan
 
 
-def submit_run_plan(client, plan, allow_outside_window=None):
+def submit_run_plan(client, plan, allow_outside_window=None, diagnostic_capture=False):
     """提交已预览的同一快照；不再次随机生成、重查点位或重建路线。"""
     plan.validate(client)
     data = plan.data()
     track, pts = data["track"], data["points"]
+    expected_completion = evaluate_completion(
+        track, pts, data["policy"], data["min_distance"], data.get("run_rules"))
+    if not expected_completion["supported"]:
+        raise ValueError("当前仅实现顺序跑 policy=1 的完成判定，无法提交此模式")
+    if data.get("completion") is not None and data["completion"] != expected_completion:
+        raise ValueError("方案完成判定与冻结数据不一致，请重新生成并预览")
     outside = data["allow_outside_window"] if allow_outside_window is None else bool(allow_outside_window)
     ok_win, reason = _check_time_window(track["startTime"], track["totalTime"], data["valid_time"])
     if not ok_win and not outside:
@@ -310,6 +365,59 @@ def submit_run_plan(client, plan, allow_outside_window=None):
         warn("时间外测试：跳过本地有效时段检查，服务端仍可能拒绝或判为无效")
     plan.claim(client)
 
+    diagnostics = None
+    handler = None
+    diagnostic_dir = data.get("diagnostic_dir")
+    if diagnostic_dir:
+        try:
+            from ..run_diagnostics import RunDiagnosticArchive
+            diagnostics = RunDiagnosticArchive.open_existing(diagnostic_dir)
+            handler = diagnostics.attach(log)
+        except (OSError, ValueError) as exc:
+            diagnostics = None
+            warn("无法续写本地通信诊断包，继续提交：{}".format(exc))
+    elif diagnostic_capture:
+        try:
+            from ..run_diagnostics import RunDiagnosticArchive
+            diagnostics = RunDiagnosticArchive(plan.plan_id)
+            diagnostics.capture_plan(data, plan.plan_id)
+            handler = diagnostics.attach(log)
+        except OSError as exc:
+            diagnostics = None
+            warn("无法创建本地通信诊断包，继续提交：{}".format(exc))
+
+    if diagnostics:
+        diagnostics.capture("manifest.json", {
+            "createdAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "planId": plan.plan_id,
+            "status": "submission_started",
+        })
+
+    try:
+        with diagnostics.active() if diagnostics else nullcontext():
+            result = _submit_claimed_plan(client, plan.plan_id, data, diagnostics)
+        if diagnostics:
+            result["diagnostic_dir"] = str(diagnostics.directory)
+            diagnostics.capture("run_result.json", result)
+            diagnostics.capture("manifest.json", {
+                "createdAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "planId": plan.plan_id,
+                "rrid": result.get("rrid"),
+                "status": "complete",
+            })
+        return result
+    except Exception as exc:
+        if diagnostics:
+            diagnostics.capture("failure.json", {"error": str(exc), "planId": plan.plan_id})
+        raise
+    finally:
+        if handler:
+            log.removeHandler(handler)
+
+
+def _submit_claimed_plan(client, plan_id, data, diagnostics=None):
+    track, pts = data["track"], data["points"]
+
     step("[4/6] 提交跑步记录…")
     result = api_submit.submit_record(
         client, track,
@@ -317,6 +425,8 @@ def submit_run_plan(client, plan, allow_outside_window=None):
         min_distance=data["min_distance"],
         weight=data["weight"], face_check=data["face_check"],
         five_point_json=data["five_point_json"],
+        completion=data.get("completion"), run_rules=data.get("run_rules"),
+        diagnostics=diagnostics,
     )
     time.sleep(1)
 
@@ -325,9 +435,13 @@ def submit_run_plan(client, plan, allow_outside_window=None):
         track, result["rrid"], result["uuid"],
         client.uid(), pts, point_wrapper=data["five_point_json"],
     )
+    if diagnostics:
+        diagnostics.capture("obs_run_data.json", obj)
     payload = json.dumps(obj, separators=(",", ":")).encode()
     keys = wire.obs_keys(track, result["rrid"], result["uuid"])
     obs_ok = api_obs.upload_both_keys(client, keys, payload)
+    if diagnostics:
+        diagnostics.capture("obs_upload.json", {"attempted": len(keys), "succeeded": obs_ok})
     if obs_ok == 2:
         ok("OBS 双 key 上传成功")
     else:
@@ -339,10 +453,15 @@ def submit_run_plan(client, plan, allow_outside_window=None):
     checkpoint_report = None
     try:
         detail = api_records.fetch_one_record(client, result["rrid"])
+        if diagnostics:
+            diagnostics.capture("record_detail.json", detail)
         ok(f"详情读取 rrid={result['rrid']} complete={detail.get('complete')} "
            f"dis={detail.get('totalDis')} time={detail.get('totalTime')}")
         detail_ok = True
-        checkpoint_report = analyze_checkpoints(detail)
+        checkpoint_report = analyze_run_checkpoints(
+            detail, submitted_point_wrapper=data["five_point_json"], local_obs=obj)
+        if diagnostics:
+            diagnostics.capture("checkpoint_report.json", checkpoint_report)
         log.info(format_report(checkpoint_report))
     except Exception as e:
         warn(f"详情检查失败（记录已提交，请勿直接重复提交）: {e}")
@@ -351,7 +470,7 @@ def submit_run_plan(client, plan, allow_outside_window=None):
     result["obs_ok"] = obs_ok
     result["detail_ok"] = detail_ok
     result["checkpoint_report"] = checkpoint_report
-    result["plan_id"] = plan.plan_id
+    result["plan_id"] = plan_id
     result["dist"] = track["totalDistance"]
     result["dur"] = track["totalTime"]
     result["cadence_avg"] = (track["totalSteps"] / track["totalTime"] * 60

@@ -125,6 +125,7 @@ DEFAULT_CONFIG = {
     "pace_min": 360,
     "pace_max": 480,
     "face_check": True,
+    "diagnostic_capture": False,
     "amap_key": "",
     "city": "成都市",
 

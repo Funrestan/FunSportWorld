@@ -7,6 +7,7 @@ from ..crypto.envelope import build_envelope, now_ms
 from ..crypto.sign import md5_url_sign
 from ..crypto.decrypt import parse_data_field, get_field
 from ..logger import log, ok, warn, dim
+from ..run_diagnostics import current_archive
 
 POINTS_PATH = "/api/v560/get/1/distance/1"
 POINT_REQUEST_SCHEMA = 2
@@ -18,6 +19,7 @@ def fetch_points(client, anchor=None, run_area_id=None, with_metadata=False, fre
 
     context = {"uid": client.uid(), "unid": str(client.session_data.get("unid", "0")),
                "anchor": list(anchor), "runAreaId": run_area_id}
+    archive = current_archive()
     cache = load_points_cache(with_metadata=True)
     if cache and (cache.get("context") != context
                   or cache.get("metadata", {}).get("point_request_schema") != POINT_REQUEST_SCHEMA):
@@ -25,8 +27,18 @@ def fetch_points(client, anchor=None, run_area_id=None, with_metadata=False, fre
     if cache and not fresh:
         ts, pts = cache.get("ts", 0), cache.get("points", [])
         if pts and 0 <= now_ms() - ts < POINTS_TTL_MS:
+            if archive:
+                archive.record_message("point-cache", "CACHE", "points_cache.json",
+                                       request={"context": context},
+                                       response={"hit": True, "count": len(pts),
+                                                 "ageMs": now_ms() - ts})
             ok(f"点位缓存命中（{(now_ms()-ts)//1000}s 前，{len(pts)} 个）")
             return (pts, cache.get("metadata", {})) if with_metadata else pts
+    if archive:
+        archive.record_message("point-cache", "CACHE", "points_cache.json",
+                               request={"context": context},
+                               response={"hit": False, "freshRequested": bool(fresh),
+                                         "staleAvailable": bool(cache and cache.get("points"))})
 
     uid = client.uid()
     unid = str(client.session_data["unid"]) if client.session_data else "0"
@@ -53,6 +65,10 @@ def fetch_points(client, anchor=None, run_area_id=None, with_metadata=False, fre
     except Exception as e:
         warn(f"点位接口失败: {e}")
         if not fresh and allow_stale and cache and cache.get("points"):
+            if archive:
+                archive.record_message("point-cache", "CACHE", "points_cache.json",
+                                       request={"context": context},
+                                       response={"fallback": "stale", "count": len(cache["points"])})
             warn("回退最近缓存")
             return (cache["points"], cache.get("metadata", {})) if with_metadata else cache["points"]
         raise

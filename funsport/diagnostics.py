@@ -10,6 +10,8 @@ MAX_BYTES = 8 * 1024 * 1024
 POINT_KEYS = ("fivePointJson", "pointsResModels")
 WRAPPER_KEYS = ("data", "record", "runningRecord", "runData",
                 "fixed_point_json", "fixedPointJson")
+RULE_LABELS = {1: "距离", 7: "时长", 9: "按顺序通过所有点位",
+               11: "步频", 12: "配速", 18: "人脸验证"}
 
 
 def decode_value(value):
@@ -46,6 +48,7 @@ def analyze_checkpoints(document):
     sources, warnings = [], []
     complete_values = set()
     render_contexts = []
+    rules = []
 
     def visit(value, path, depth=0, point_list=False):
         """递归读取允许的字段，避免扫描或输出无关个人资料。"""
@@ -67,11 +70,17 @@ def analyze_checkpoints(document):
                 warnings.append(path + "：点位超过 5000 个，停止解析")
                 return
             passed = gcj = bd = placeholders = conflicts = 0
+            point_states = []
             max_delta = 0.0
-            for item in value:
+            for index, item in enumerate(value):
                 if not isinstance(item, dict):
                     warnings.append(path + "：列表含非对象项")
                     continue
+                point_states.append({
+                    "index": index,
+                    "position": item.get("position") if type(item.get("position")) is int else None,
+                    "is_pass": item.get("isPass") if isinstance(item.get("isPass"), bool) else None,
+                })
                 passed += item.get("isPass") is True
                 gcj += _valid_pair(item.get("glat"), item.get("glon"))
                 bd += _valid_pair(item.get("lat"), item.get("lon"))
@@ -85,7 +94,8 @@ def analyze_checkpoints(document):
                     pass
             sources.append({"path": path, "count": len(value),
                             "passed": passed, "gcj_valid": gcj, "bd_valid": bd,
-                            "coordinate_conflicts": conflicts, "max_delta_m": round(max_delta, 2)})
+                            "coordinate_conflicts": conflicts, "max_delta_m": round(max_delta, 2),
+                            "point_states": point_states})
             if value and gcj < len(value):
                 warnings.append(path + "：部分 glat/glon 缺失、越界或为占位坐标")
             if placeholders:
@@ -98,6 +108,22 @@ def analyze_checkpoints(document):
             return
         if isinstance(value.get("complete"), bool):
             complete_values.add(value["complete"])
+        if "reasonList" in value:
+            reason_list = value["reasonList"]
+            if not isinstance(reason_list, list) or len(reason_list) > 5000:
+                warnings.append(path + ".reasonList：不是有效的规则列表")
+            else:
+                for index, rule in enumerate(reason_list):
+                    rule_path = "{}.reasonList[{}]".format(path, index)
+                    if not isinstance(rule, dict):
+                        warnings.append(rule_path + "：不是规则对象")
+                        continue
+                    rules.append({
+                        "path": rule_path,
+                        "type": rule.get("type") if type(rule.get("type")) is int else None,
+                        "complete": rule.get("complete") if isinstance(rule.get("complete"), bool) else None,
+                        "complete_status": rule.get("completeStatus") if type(rule.get("completeStatus")) is int else None,
+                    })
         context = {key: value[key] for key in ("sportType", "policy")
                    if type(value.get(key)) is int}
         if context:
@@ -116,9 +142,54 @@ def analyze_checkpoints(document):
     status = "present" if any(s["count"] for s in sources) else "empty" if sources else "missing"
     if warnings and status == "missing":
         status = "invalid"
+    checkpoint_rules = [rule["complete"] for rule in rules if rule["type"] == 9]
+    checkpoint_complete = (checkpoint_rules[0] if checkpoint_rules
+                           and all(value is checkpoint_rules[0] for value in checkpoint_rules) else None)
+    if checkpoint_rules and checkpoint_complete is None:
+        warnings.append("顺序点位规则状态缺失或冲突，结果记为未知")
+    if complete is True and checkpoint_complete is False:
+        warnings.append("complete=true，但服务端顺序点位规则未通过；顶层完成状态不能代替逐项规则")
     return {"status": status, "sources": sources,
             "warnings": list(dict.fromkeys(warnings)), "complete": complete,
-            "render_contexts": render_contexts}
+            "render_contexts": render_contexts, "rules": rules,
+            "checkpoint_rule_complete": checkpoint_complete}
+
+
+def _comparable_states(report):
+    if report is None or report["status"] != "present":
+        return None
+    candidates = []
+    for source in report["sources"]:
+        states = source.get("point_states", [])
+        positions = [state["position"] for state in states]
+        if (len(states) != source["count"] or not states
+                or any(position is None or position == 999 for position in positions)
+                or len(set(positions)) != len(positions)
+                or any(state["is_pass"] is None for state in states)):
+            return None
+        candidates.append(states)
+    if not candidates or any(states != candidates[0] for states in candidates[1:]):
+        return None
+    return candidates[0]
+
+
+def analyze_run_checkpoints(detail, submitted_point_wrapper=None, local_obs=None):
+    """联合检查提交快照与服务端规则；本地 OBS 内容不等于远端验证结果。"""
+    report = analyze_checkpoints(detail)
+    submitted = (analyze_checkpoints({"fivePointJson": submitted_point_wrapper})
+                 if submitted_point_wrapper is not None else None)
+    obs = analyze_checkpoints(local_obs) if local_obs is not None else None
+    reports = {"server_detail": report, "submitted": submitted, "local_obs": obs}
+    comparisons = []
+    for left, right in (("submitted", "local_obs"), ("server_detail", "submitted"),
+                        ("server_detail", "local_obs")):
+        left_states, right_states = _comparable_states(reports[left]), _comparable_states(reports[right])
+        status = "unknown" if left_states is None or right_states is None else (
+            "match" if left_states == right_states else "mismatch")
+        comparisons.append({"left": left, "right": right, "status": status})
+    report.update({"submitted": submitted, "local_obs": obs,
+                   "point_state_comparisons": comparisons, "remote_obs_verified": False})
+    return report
 
 
 def format_report(report):
@@ -135,6 +206,27 @@ def format_report(report):
     for context in report.get("render_contexts", []):
         lines.append("显示上下文 {}：sportType={} / policy={}".format(
             context["path"], context.get("sportType", "未提供"), context.get("policy", "未提供")))
+    for rule in report.get("rules", []):
+        rule_label = RULE_LABELS.get(rule["type"], "规则 type={}".format(rule["type"]))
+        state = "未知" if rule["complete"] is None else "通过" if rule["complete"] else "未通过"
+        lines.append("服务端规则 {}：{}（completeStatus={}）".format(
+            rule_label, state, rule["complete_status"]))
+    evidence_labels = {"server_detail": "服务端详情", "submitted": "提交快照", "local_obs": "本地 OBS 对象"}
+    for name in ("submitted", "local_obs"):
+        evidence = report.get(name)
+        if evidence is not None:
+            lines.append("{}：{}".format(evidence_labels[name], labels[evidence["status"]]))
+            for source in evidence["sources"]:
+                lines.append("  {}：点位 {}，isPass=true {}".format(
+                    source["path"], source["count"], source["passed"]))
+            lines.extend("注意（{}）：{}".format(evidence_labels[name], warning)
+                         for warning in evidence["warnings"])
+    for comparison in report.get("point_state_comparisons", []):
+        state = {"match": "一致", "mismatch": "不一致", "unknown": "证据不足，无法比较"}[comparison["status"]]
+        lines.append("{} / {} 点位顺序及通过状态：{}".format(
+            evidence_labels[comparison["left"]], evidence_labels[comparison["right"]], state))
+    if "remote_obs_verified" in report:
+        lines.append("本地 OBS 对象仅代表准备上传的内容；未下载验证远端对象，字段一致不代表服务端规则通过。")
     lines.extend("注意：" + text for text in report["warnings"])
     lines.extend(["", "轨迹坐标、打卡点字段、服务端达标状态是不同的数据。",
                   "详情可能仅返回摘要；缺少字段不能证明 OBS 或 App 中也没有。",

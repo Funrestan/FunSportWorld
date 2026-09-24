@@ -16,7 +16,7 @@ from funsport.track import wire
 
 
 class CheckpointOrderTests(IsolatedCase):
-    """验证编号来自规划顺序，且不能改通过状态或悄悄修已冻结方案。"""
+    """验证编号与状态各自演进，且不能悄悄修改已冻结方案。"""
 
     def points(self):
         """创建四个带稳定身份和不同通过状态的虚构点位。"""
@@ -153,7 +153,10 @@ class CheckpointOrderTests(IsolatedCase):
         data = plan.data()
         self.assertEqual(raw, before)
         self.assertEqual(data["policy"], 1)
-        self.assertEqual(route.call_args.args[0], data["points"])
+        self.assertEqual([{k: v for k, v in p.items() if k != "isPass"} for p in route.call_args.args[0]],
+                         [{k: v for k, v in p.items() if k != "isPass"} for p in data["points"]])
+        self.assertTrue(all(point["isPass"] for point in data["points"]))
+        self.assertEqual(len(data["checkpoint_evaluation"]["events"]), 4)
         self.assertEqual(route.call_args.kwargs["route_seed"], 42)
         self.assertEqual([point["position"] for point in data["points"]], [0, 1, 2, 3])
         wrapper = json.loads(data["five_point_json"])
@@ -170,7 +173,8 @@ class CheckpointOrderTests(IsolatedCase):
             point["position"] = position
         plan, route = self.prepare(raw)
         self.assertEqual([point["id"] for point in route.call_args.args[0]], [32, 34, 31, 33])
-        self.assertEqual(route.call_args.args[0], plan.data()["points"])
+        self.assertEqual([{k: v for k, v in p.items() if k != "isPass"} for p in route.call_args.args[0]],
+                         [{k: v for k, v in p.items() if k != "isPass"} for p in plan.data()["points"]])
         self.assertIn("沿用源顺序", format_plan(plan))
 
     def test_generation_for_other_policy_keeps_999(self):
@@ -197,7 +201,7 @@ class CheckpointOrderTests(IsolatedCase):
         submit.assert_not_called()
 
     def test_submission_keeps_repaired_wrapper_and_pass_states(self):
-        """从缺省顺序生成后，HTTP和解压OBS均保持编号与原通过状态。"""
+        """HTTP和解压OBS均保存预览中已经评估的最终状态及到点轨迹。"""
         raw = self.points()
         plan, _ = self.prepare(raw)
         data = plan.data()
@@ -210,7 +214,15 @@ class CheckpointOrderTests(IsolatedCase):
         obs_wrapper = json.loads(gzip.decompress(base64.b64decode(obs["fixed_point_json"])))
         self.assertEqual(http_points, data["points"])
         self.assertEqual(json.loads(obs_wrapper["fivePointJson"]), http_points)
-        self.assertEqual([point["isPass"] for point in http_points], [point["isPass"] for point in raw])
+        self.assertEqual([point["isPass"] for point in http_points], [True] * 4)
+        self.assertEqual([point["isPass"] for point in raw], [False, True, False, False])
+        self.assertTrue(submit.call_args.kwargs["completion"]["complete"])
+        obs_track = json.loads(gzip.decompress(base64.b64decode(obs["run_data"])))
+        samples = json.loads(obs_track["allLocJson"])
+        event_indices = [event["sample_index"] for event in data["checkpoint_evaluation"]["events"]]
+        self.assertEqual([samples[index]["type"] for index in event_indices], [2] * 4)
+        self.assertEqual(samples[0]["type"], 5)
+        self.assertEqual(samples[-1]["type"], 6)
         self.assertEqual(submit.call_args.kwargs["policy"], 1)
 
     def test_old_999_plan_requires_new_preview(self):

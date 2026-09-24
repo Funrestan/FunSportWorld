@@ -32,6 +32,12 @@ class GuiTests(IsolatedCase):
         super().setUp()
         self.root = tk.Tk()
         self.root.withdraw()
+        self.map_patch = patch("funsport.gui.tkintermapview.TkinterMapView")
+        self.map_patch.start()
+        self.addCleanup(self.map_patch.stop)
+        self.icon_patch = patch.object(App, "_icon_cache", {})
+        self.icon_patch.start()
+        self.addCleanup(self.icon_patch.stop)
         self.app = App(self.root)
         self.addCleanup(self.cleanup_window)
         self.error_patch = patch("funsport.gui.messagebox.showerror")
@@ -54,12 +60,19 @@ class GuiTests(IsolatedCase):
                 self.fail("GUI task timed out")
             time.sleep(0.01)
 
+    def preview_parameters(self):
+        """直接注入预览时也包含生成按钮读取的诊断开关。"""
+        params = run_parameters(self.app.values(self.app.run_vars))
+        params["diagnostic_capture"] = bool(self.app.settings_vars["diagnostic_capture"].get())
+        return params
+
     def test_startup_does_not_write_or_login(self):
         """启动只读配置，不创建身份、不保存配置、更不联网。"""
         self.assertFalse(config.CONFIG_FILE.exists())
         self.assertFalse(config.IDENTITY_FILE.exists())
         self.assertFalse(self.app.busy)
         self.assertEqual(len(self.app.tabs.tabs()), 4)
+        self.assertFalse(self.app.settings_vars["diagnostic_capture"].get())
 
     def test_logout_cancel_never_requests(self):
         """用户取消退出确认时不发送请求、不删除本地会话。"""
@@ -148,16 +161,18 @@ class GuiTests(IsolatedCase):
 
     def test_declined_confirmation_never_submits(self):
         """用户取消确认时不发送请求。"""
-        self.app.show_plan(sample_plan(), run_parameters(self.app.values(self.app.run_vars)))
-        with patch("funsport.gui.messagebox.askyesno", return_value=False), patch("funsport.gui.services.with_client") as client:
+        self.app.show_plan(sample_plan(), self.preview_parameters())
+        with patch("funsport.gui.messagebox.askyesno", return_value=False) as confirmation, \
+                patch("funsport.gui.services.with_client") as client:
             self.app.submit_run()
+            confirmation.assert_called_once()
             client.assert_not_called()
 
     def test_submission_displays_partial_status(self):
         """提交一次后显示结果与部分上传状态，不显示打卡已验证。"""
         result = {"rrid": 123, "dist": 1000, "dur": 400, "obs_ok": 1, "detail_ok": False}
         plan = sample_plan()
-        self.app.show_plan(plan, run_parameters(self.app.values(self.app.run_vars)))
+        self.app.show_plan(plan, self.preview_parameters())
         with patch("funsport.gui.messagebox.askyesno", return_value=True), \
                 patch("funsport.gui.services.with_client", side_effect=lambda action: action(fake_client())), \
                 patch("funsport.api.flow.submit_run_plan", return_value=result) as flow:
@@ -215,7 +230,7 @@ class GuiTests(IsolatedCase):
     def test_outside_toggle_keeps_same_preview(self):
         """时间外开关只改变提交许可，不重新生成已检查的轨迹。"""
         plan = sample_plan(outside=True)
-        self.app.show_plan(plan, run_parameters(self.app.values(self.app.run_vars)))
+        self.app.show_plan(plan, self.preview_parameters())
         with patch("funsport.gui.services.with_client") as client:
             self.app.submit_run()
             client.assert_not_called()
@@ -229,16 +244,38 @@ class GuiTests(IsolatedCase):
             self.pump()
         self.assertTrue(submit.call_args.args[2])
 
-    def test_map_failure_preserves_preview(self):
-        """底图请求失败不丢失轨迹和可检查的方案。"""
+    def test_diagnostic_setting_is_passed_to_submit(self):
+        plan = sample_plan()
+        self.app.settings_vars["diagnostic_capture"].set(True)
+        params = run_parameters(self.app.values(self.app.run_vars))
+        params["diagnostic_capture"] = True
+        self.app.show_plan(plan, params)
+        self.assertIs(self.app.plan, plan)
+        with patch("funsport.gui.messagebox.askyesno", return_value=True), \
+                patch("funsport.gui.services.with_client", side_effect=lambda action: action(fake_client())), \
+                patch("funsport.api.flow.submit_run_plan", return_value={
+                    "rrid": 123, "dist": 1000, "dur": 400, "obs_ok": 2, "detail_ok": False}) as submit:
+            self.app.submit_run()
+            self.pump()
+        self.assertTrue(submit.call_args.kwargs["diagnostic_capture"])
+
+    def test_changing_diagnostic_setting_invalidates_existing_preview(self):
         plan = sample_plan()
         self.app.show_plan(plan, run_parameters(self.app.values(self.app.run_vars)))
-        with patch("funsport.map_preview.fetch_background", side_effect=ValueError("测试底图失败")):
-            self.app.load_map()
-            self.pump()
+        self.app.settings_vars["diagnostic_capture"].set(True)
+        self.assertIsNone(self.app.plan)
+
+    def test_map_refresh_preserves_preview(self):
+        """瓦片地图刷新只重绘当前轨迹，不改变已经冻结的方案。"""
+        plan = sample_plan()
+        self.app.show_plan(plan, self.preview_parameters())
+        self.app.map_widget.reset_mock()
+        self.app.load_map()
         self.assertIs(self.app.plan, plan)
-        self.assertIn("失败", self.app.map_status.get())
-        self.assertTrue(self.app.canvas.find_withtag("route"))
+        self.app.map_widget.set_path.assert_called_once()
+        self.assertEqual(self.app.map_widget.set_marker.call_count, len(plan.data()["points"]) + 2)
+        self.assertIsNotNone(self.app.track_path)
+        self.assertIn("高德瓦片", self.app.map_status.get())
 
     def test_local_preview_never_autoloads_map_or_enables_submit(self):
         """本地预览不自动加载底图；按钮与后端都不能把它当成在线方案。"""

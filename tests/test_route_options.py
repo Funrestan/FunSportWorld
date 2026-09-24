@@ -194,14 +194,15 @@ class RoadOptionTests(IsolatedCase):
             key.assert_not_called()
 
     def test_plan_seeds_choose_different_roads_keep_checkpoint_order(self):
-        """端到端准备方案改变道路，但不改学校顺序、身份、状态和包装。"""
+        """道路选择保持点位身份与顺序，评估后的状态与包装保持一致。"""
         self.warm_cache()
         first, second = self.prepare_plan(1), self.prepare_plan(2)
         one, two = first.data(), second.data()
         self.assertNotEqual(one["route"]["road_fingerprint"], two["route"]["road_fingerprint"])
         self.assertEqual([point["id"] for point in one["points"]], [31, 32, 33, 34])
         self.assertEqual([point["position"] for point in two["points"]], [0, 1, 2, 3])
-        self.assertTrue(all(point["isPass"] is False for point in two["points"]))
+        self.assertTrue(all(point["isPass"] is True for point in two["points"]))
+        self.assertEqual([event["position"] for event in two["checkpoint_evaluation"]["events"]], [0, 1, 2, 3])
         self.assertEqual(json.loads(json.loads(two["five_point_json"])["fivePointJson"]), two["points"])
         first.validate(fake_client())
         second.validate(fake_client())

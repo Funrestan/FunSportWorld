@@ -6,7 +6,7 @@ import json
 from unittest.mock import patch
 
 from tests.support import IsolatedCase
-from funsport.diagnostics import analyze_checkpoints, decode_value, format_report, inspect_file
+from funsport.diagnostics import analyze_checkpoints, analyze_run_checkpoints, decode_value, format_report, inspect_file
 from funsport.track.wire import five_point_wrapper
 
 
@@ -59,6 +59,67 @@ class DiagnosticTests(IsolatedCase):
         report = analyze_checkpoints({"complete": True, "allLocJson": "[]"})
         self.assertTrue(report["complete"])
         self.assertEqual(report["status"], "missing")
+
+    def test_server_rule_overrides_no_checkpoint_conclusions(self):
+        """整体达标仍可能未通过顺序点位规则，原始两个状态都保留。"""
+        report = analyze_checkpoints({"complete": True, "reasonList": [
+            {"type": 9, "complete": False, "completeStatus": 0, "reason": "private-text"},
+            {"type": 1, "complete": True, "completeStatus": 1},
+        ]})
+        self.assertTrue(report["complete"])
+        self.assertIs(report["checkpoint_rule_complete"], False)
+        self.assertEqual(len(report["rules"]), 2)
+        text = format_report(report)
+        self.assertIn("按顺序通过所有点位：未通过", text)
+        self.assertIn("距离：通过", text)
+        self.assertNotIn("private-text", text)
+
+    def test_rule_complete_requires_unambiguous_boolean(self):
+        """规则的数字状态或字符串不能替代明确的布尔值。"""
+        report = analyze_checkpoints({"reasonList": [{"type": 9, "complete": "true", "completeStatus": 1}]})
+        self.assertIsNone(report["checkpoint_rule_complete"])
+        conflict = analyze_checkpoints({"reasonList": [{"type": 9, "complete": True}],
+                                        "record": {"reasonList": [{"type": 9, "complete": False}]}})
+        self.assertIsNone(conflict["checkpoint_rule_complete"])
+        self.assertIn("顺序点位规则状态缺失或冲突", format_report(conflict))
+
+    def test_combined_local_evidence_does_not_verify_remote_obs(self):
+        """详情省略点位时，本地快照可核对，但不能据此确认远端内容。"""
+        points = [{"position": index, "isPass": False} for index in range(5)]
+        wrapper = {"fivePointJson": json.dumps(points)}
+        obs = {"fixed_point_json": base64.b64encode(gzip.compress(json.dumps(wrapper).encode())).decode()}
+        detail = {"complete": True, "fivePointJson": "", "reasonList": [{"type": 9, "complete": False}]}
+        original = copy.deepcopy((detail, wrapper, obs))
+        report = analyze_run_checkpoints(detail, wrapper, obs)
+        self.assertEqual(report["status"], "empty")
+        self.assertEqual(report["local_obs"]["sources"][0]["passed"], 0)
+        self.assertEqual([pair["status"] for pair in report["point_state_comparisons"]],
+                         ["match", "unknown", "unknown"])
+        self.assertIs(report["remote_obs_verified"], False)
+        self.assertIs(report["checkpoint_rule_complete"], False)
+        self.assertEqual((detail, wrapper, obs), original)
+        self.assertIn("未下载验证远端对象", format_report(report))
+
+    def test_point_state_comparison_finds_changed_order_and_state(self):
+        """点位通过数量相同也不能掩盖顺序或逐点状态差异。"""
+        points = [{"position": 0, "isPass": True}, {"position": 1, "isPass": False}]
+        for changed in (list(reversed(points)), [{"position": 0, "isPass": False}, {"position": 1, "isPass": True}]):
+            with self.subTest(changed=changed):
+                report = analyze_run_checkpoints({"fivePointJson": points}, points,
+                                                 {"fixed_point_json": {"fivePointJson": changed}})
+                self.assertEqual([pair["status"] for pair in report["point_state_comparisons"]],
+                                 ["mismatch", "match", "mismatch"])
+
+    def test_ambiguous_or_missing_points_cannot_compare(self):
+        """缺状态、重复序号、占位点、空点位或损坏项都不作为匹配证明。"""
+        for points in ([], [{"position": 0}], [{"position": 999, "isPass": True}],
+                       [{"position": 0, "isPass": True}] * 2, ["invalid"],
+                       [{"position": True, "isPass": True}]):
+            with self.subTest(points=points):
+                report = analyze_run_checkpoints({}, points, {"fixed_point_json": {"fivePointJson": points}})
+                self.assertEqual(report["point_state_comparisons"][0]["status"], "unknown")
+        self.assertTrue(all(pair["status"] == "unknown"
+                            for pair in analyze_run_checkpoints({})["point_state_comparisons"]))
 
     def test_empty_and_corrupt_are_distinct(self):
         """区分缺字段、空列表和无法解析的字段。"""

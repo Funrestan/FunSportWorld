@@ -41,6 +41,7 @@ def settings_snapshot():
     session = read_object(config.SESSION_FILE)
     return {"username": cfg.get("username", ""), "password": "", "amap_key": "",
             "city": cfg.get("city", ""), "remember": bool(cfg.get("remember")),
+            "diagnostic_capture": bool(cfg.get("diagnostic_capture", False)),
             "anchor_lat": str(identity.get("anchor_lat", "")),
             "anchor_lon": str(identity.get("anchor_lon", "")),
             "start_before_min": str(cfg["start_before_min"]),
@@ -78,7 +79,8 @@ def save_settings(values):
     changed_campus = city != cfg.get("city") or any(
         identity.get(key) != coordinates.get(key) for key in ("anchor_lat", "anchor_lon"))
     cfg.update(username=username, city=city, start_before_min=low,
-               start_before_max=high, remember=bool(values.get("remember")))
+               start_before_max=high, remember=bool(values.get("remember")),
+               diagnostic_capture=bool(values.get("diagnostic_capture", False)))
     password = values.get("password", "")
     if not cfg["remember"] or changed_user:
         cfg["password"] = ""

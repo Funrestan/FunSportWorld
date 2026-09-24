@@ -7,6 +7,7 @@ from tests.support import IsolatedCase
 from tests.plan_fixture import fake_client
 from funsport import config
 from funsport.api import points
+from funsport.run_diagnostics import RunDiagnosticArchive
 
 
 class PointTests(IsolatedCase):
@@ -30,6 +31,21 @@ class PointTests(IsolatedCase):
         self.assertEqual(first, second)
         self.assertEqual(first[1]["runAreaId"], 7)
         self.assertTrue(first[1]["freedomShowFence"])
+        client.call.assert_called_once()
+
+    def test_diagnostic_records_point_cache_miss_and_hit(self):
+        client = self.client()
+        archive = RunDiagnosticArchive("point-cache-test")
+        with archive.active(), patch.object(points, "build_envelope", return_value=SimpleNamespace(json="fixture")):
+            points.fetch_points(client)
+            points.fetch_points(client)
+
+        messages = json.loads((archive.directory / "communication.json").read_text(encoding="utf-8"))["messages"]
+        decisions = [message["response"] for message in messages if message["phase"] == "point-cache"]
+        self.assertEqual(decisions[0], {"hit": False, "freshRequested": False, "staleAvailable": False})
+        self.assertTrue(decisions[1]["hit"])
+        self.assertEqual(decisions[1]["count"], 1)
+        self.assertGreaterEqual(decisions[1]["ageMs"], 0)
         client.call.assert_called_once()
 
     def test_point_request_does_not_force_sport_type(self):

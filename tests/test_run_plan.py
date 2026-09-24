@@ -93,6 +93,20 @@ class PlanTests(IsolatedCase):
                 flow.submit_run_plan(fake_client(), plan)
             submit.assert_called_once()
 
+    def test_local_completion_failure_does_not_claim_or_submit_plan(self):
+        for unsupported in (False, True):
+            data = sample_plan().data()
+            if unsupported:
+                data["policy"] = 2
+            else:
+                data["completion"] = {"complete": True, "unCompleteReason": 0}
+            plan = RunPlan.create(fake_client(), data)
+            with self.subTest(unsupported=unsupported), patch.object(flow.api_submit, "submit_record") as submit:
+                with self.assertRaises(ValueError):
+                    flow.submit_run_plan(fake_client(), plan)
+                self.assertFalse(plan.attempted)
+                submit.assert_not_called()
+
     def test_owner_expiry_and_future_checks(self):
         """不接受别的账号、过期方案，也不把时间外开关当成未来记录开关。"""
         plan = sample_plan()

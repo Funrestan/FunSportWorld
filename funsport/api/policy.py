@@ -4,6 +4,7 @@
 valid_time 是学校允许的跑步时间段，格式 [{"start": "HH:MM:SS", "end": "HH:MM:SS"}, ...]。
 """
 import json
+from copy import deepcopy
 
 from ..crypto.decrypt import get_field
 from ..logger import ok
@@ -13,12 +14,16 @@ POLICY_PATH = "/api/v70103/runModePolicy"
 
 
 class PolicyInfo:
-    def __init__(self, timestamp, policy, min_distance, valid_time):
+    def __init__(self, timestamp, policy, min_distance, valid_time,
+                 run_rules=None, geo_fence=None, run_area_models=None):
         self.timestamp = timestamp
         self.policy = policy
         self.min_distance = min_distance
         # list of {"start": "HH:MM:SS", "end": "HH:MM:SS"}
         self.valid_time = valid_time
+        self.run_rules = deepcopy(run_rules) if run_rules is not None else {}
+        self.geo_fence = deepcopy(geo_fence)
+        self.run_area_models = deepcopy(run_area_models)
 
 
 def fetch_policy(client):
@@ -65,6 +70,9 @@ def fetch_policy(client):
         policy=policy,
         min_distance=rule.get("minDistance", 1000),
         valid_time=vt,
+        run_rules=rule,
+        geo_fence=get_field(biz, "geoFence"),
+        run_area_models=get_field(biz, "runAreaModels"),
     )
     ok(f"[policy] ts={p.timestamp} policy={p.policy} minDist={p.min_distance} "
        f"validTime={vt}")

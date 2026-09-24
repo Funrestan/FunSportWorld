@@ -143,16 +143,24 @@ def format_plan(plan):
         "配速：{:.0f} 秒/km / 步频：{:.0f} 步/分钟 / 总步数：{}".format(pace, cadence, track["totalSteps"]),
         "轨迹采样：{} / 打卡点：{} / 种子：{}".format(len(track["locations"]), len(data["points"]), data["seed"]),
         "有效时间：" + data["window_reason"],
-        "点位修复：保留源字段、补齐坐标；几何靠近不等于官方打卡。",
+        "点位状态：本地模拟结果，服务端判定待提交后查询。",
         "底图与轨迹使用 GCJ-02；底图不参与提交。",
     ]
     order = data.get("checkpoint_order", {})
     if order.get("source") == "route_order":
-        lines.append("点位顺序：按本次高德途经顺序补齐0至{}，未改通过状态".format(len(data["points"]) - 1))
+        lines.append("点位顺序：按本次高德途经顺序补齐0至{}".format(len(data["points"]) - 1))
     elif order.get("source") == "source":
         lines.append("点位顺序：沿用源顺序，路线与上传一致")
     elif order.get("source") == "unchanged":
         lines.append("点位顺序：当前非顺序模式，保留源字段")
+    evaluation = data.get("checkpoint_evaluation")
+    if evaluation and evaluation.get("supported"):
+        lines.append("本地顺序点：{}/{}；本次到点事件 {} 个".format(
+            evaluation["passed_count"], len(data["points"]), len(evaluation["events"])))
+    completion = data.get("completion")
+    if completion:
+        state = completion.get("complete")
+        lines.append("本地完成条件：{}".format("满足" if state is True else "未满足" if state is False else "未知"))
     route = data.get("route", {})
     if "ring_length_m" in route:
         lines.append("完整环长：{} m / 已覆盖整圈：{}".format(route["ring_length_m"], route["complete_laps"]))

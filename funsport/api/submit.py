@@ -1,14 +1,18 @@
 """跑步提交。"""
 import json
+import requests
+import time
 import uuid
 from .errors import BusinessError
 
 from ..config import HOST
+from ..completion import evaluate_completion
 from ..crypto.envelope import build_envelope, now_ms
 from ..crypto.header import build_android_header, UA_ANDROID
 from ..crypto.sign import signature, original_sign
 from ..crypto.decrypt import get_field, decrypt_response, derive_paes_key
 from ..logger import log, ok, err
+from ..run_diagnostics import current_archive
 from ..track.calorie import avg_power, official_kcal
 from ..track.geom import round_to
 
@@ -58,11 +62,36 @@ def total_ascent(locs):
 
 
 def submit_record(client, track, policy_ts, policy, min_distance,
-                  weight=68.0, face_check=1, five_point_json=""):
+                  weight=68.0, face_check=1, five_point_json="", diagnostics=None,
+                  completion=None, run_rules=None):
     """提交记录，并在业务拒绝时保留错误码和提交接口上下文。"""
     total_time = track["totalTime"]
     total_dis = track["totalDistance"]
     total_steps = track["totalSteps"]
+    point_wrapper = json.loads(five_point_json) if five_point_json else {}
+    if not isinstance(point_wrapper, dict):
+        raise ValueError("fivePointJson must contain a checkpoint wrapper")
+    points = point_wrapper.get("fivePointJson", "[]")
+    if isinstance(points, str):
+        points = json.loads(points)
+    if not isinstance(points, list):
+        raise ValueError("fivePointJson must contain a checkpoint list")
+    expected = evaluate_completion(track, points, policy, min_distance, run_rules)
+    if not expected["supported"]:
+        raise ValueError(f"Unsupported completion evaluation for policy {policy}")
+    if completion is not None:
+        if not isinstance(completion, dict) or completion.get("supported") is not True:
+            raise ValueError("Completion evaluation is missing or unsupported")
+        for field in ("policy", "complete", "unCompleteReason"):
+            if (type(completion.get(field)) is not type(expected[field])
+                    or completion[field] != expected[field]):
+                raise ValueError(f"Completion {field} disagrees with the submitted snapshot")
+        for field in ("rules", "assumptions"):
+            if field in completion and completion[field] != expected[field]:
+                raise ValueError(f"Completion {field} disagrees with the submitted snapshot")
+    else:
+        completion = expected
+    reason = expected["unCompleteReason"]
     start_ms = track["startTime"]
     stop_ms = start_ms + total_time * 1000
     ascent = total_ascent(track["locations"])
@@ -95,8 +124,8 @@ def submit_record(client, track, policy_ts, policy, min_distance,
         "speed": speed,
         "validDis": int(round_to(total_dis, 0)),
         "validTime": total_time,
-        "complete": True,
-        "unCompleteReason": 0,
+        "complete": completion["complete"],
+        "unCompleteReason": reason,
         "calorie": kcal,
         "totalSteps": total_steps,
         "avgStepFreq": avg_step_freq,
@@ -124,6 +153,10 @@ def submit_record(client, track, policy_ts, policy, min_distance,
 
     body["signature"] = signature(body, False)
     body["originalSign"] = original_sign(body, False)
+    archive = diagnostics or current_archive()
+    if archive:
+        archive.capture("completion.json", completion)
+        archive.capture("submit_body.json", body)
 
     body_plain = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
@@ -151,12 +184,34 @@ def submit_record(client, track, policy_ts, policy, min_distance,
 
     url = HOST + RECORD_PATH
     log.info(f"→ POST {RECORD_PATH} uuid={run_uuid[:8]}…")
-    resp = client.http.post(url, data=body_env.json, headers=headers, timeout=60)
+    started = time.monotonic()
+    try:
+        resp = client.http.post(url, data=body_env.json, headers=headers, timeout=60)
+    except requests.RequestException as exc:
+        if archive:
+            archive.record_message("record-submit", "POST", RECORD_PATH,
+                                   request=body, error=str(exc),
+                                   duration_ms=round((time.monotonic() - started) * 1000))
+        raise
     log.info(f"← HTTP {resp.status_code} len={len(resp.content)}")
 
     key = derive_paes_key(*body_env.key_data)
-    dec = decrypt_response(resp.content, key)
+    try:
+        dec = decrypt_response(resp.content, key)
+    except Exception as exc:
+        if archive:
+            archive.record_message("record-submit", "POST", RECORD_PATH,
+                                   request=body, response={"encryptedBytes": len(resp.content)},
+                                   status=resp.status_code, error=str(exc),
+                                   duration_ms=round((time.monotonic() - started) * 1000))
+        raise
     biz = dec.business
+    if archive:
+        archive.capture("submit_response.json", biz)
+        archive.record_message("record-submit", "POST", RECORD_PATH,
+                               request=body, response={"business": biz},
+                               status=resp.status_code,
+                               duration_ms=round((time.monotonic() - started) * 1000))
     if biz.get("error") != 10000:
         raise BusinessError(biz.get("error"), biz.get("message") or biz.get("msg"), RECORD_PATH)
 

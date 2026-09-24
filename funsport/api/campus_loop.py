@@ -14,6 +14,7 @@ from .. import config as app_config
 from ..config import get_amap_key, load_json, save_json
 from ..logger import log, ok, warn, dim
 from ..coordinates import bd09_to_gcj02, gcj02_to_bd09, checkpoint_coordinates, distance_m
+from ..run_diagnostics import current_archive
 
 AMAP_V5 = "https://restapi.amap.com/v5/direction/walking"
 AMAP_V3 = "https://restapi.amap.com/v3/direction/walking"
@@ -63,10 +64,20 @@ def _amap_walking(origin_gcj, dest_gcj, key, all_routes=False):
         params = {"key": key, "origin": o, "destination": d}
         if version == "v5":
             params.update(isindoor=0, show_fields="cost,polyline,navi", alternative_route=MAX_ALTERNATIVES)
+        archive = current_archive()
+        started = time.monotonic()
+        response = None
+        captured = False
         try:
             with requests.get(url, params=params, timeout=12) as response:
                 response.raise_for_status()
                 data = response.json()
+                if archive:
+                    archive.record_message(
+                        "amap-route", "GET", url.split("?")[0], request={"params": params},
+                        response=data, status=response.status_code,
+                        duration_ms=round((time.monotonic() - started) * 1000))
+                    captured = True
                 candidates = []
                 fingerprints = set()
                 for index in range(MAX_ALTERNATIVES):
@@ -78,7 +89,12 @@ def _amap_walking(origin_gcj, dest_gcj, key, all_routes=False):
                             fingerprints.add(digest)
             if candidates:
                 return candidates if all_routes else candidates[0]
-        except (requests.RequestException, ValueError, TypeError):
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            if archive and not captured:
+                archive.record_message(
+                    "amap-route", "GET", url.split("?")[0], request={"params": params},
+                    status=response.status_code if response is not None else None,
+                    error=str(exc), duration_ms=round((time.monotonic() - started) * 1000))
             pass
         if version == "v5":
             dim("高德 v5 未返回可用路线，尝试 v3")
@@ -384,9 +400,19 @@ def get_campus_loop(points, force_rebuild=False, route_seed=0, with_metadata=Fal
             if candidate_legs is not None and cached.get("options_digest") == _options_digest(candidate_legs):
                 legs = candidate_legs
                 ok("高德候选缓存命中，本次仍按随机种子选择道路")
+                archive = current_archive()
+                if archive:
+                    archive.record_message("route-cache", "CACHE", cache_path.name,
+                                           request={"fingerprint": fp},
+                                           response={"hit": True, "ageMs": time.time() * 1000 - stamp,
+                                                     "legCount": len(candidate_legs)})
 
     fresh = legs is None
     if fresh:
+        archive = current_archive()
+        if archive:
+            archive.record_message("route-cache", "CACHE", cache_path.name,
+                                   request={"fingerprint": fp}, response={"hit": False})
         key = get_amap_key()
         if not key:
             raise RuntimeError("未配置高德 Key：先执行 `lbs-amap --key <你的Key>` "

@@ -126,6 +126,14 @@ class ServiceTests(IsolatedCase):
         self.assertNotIn("dist", auto)
         self.assertNotIn("before", auto)
 
+    def test_diagnostic_capture_setting_defaults_off_and_persists(self):
+        self.assertFalse(services.settings_snapshot()["diagnostic_capture"])
+        saved = services.save_settings(self.form(diagnostic_capture=True))
+        self.assertTrue(saved["diagnostic_capture"])
+        self.assertTrue(services.read_object(config.CONFIG_FILE)["diagnostic_capture"])
+        saved = services.save_settings(self.form(diagnostic_capture=False))
+        self.assertFalse(saved["diagnostic_capture"])
+
     def test_start_time(self):
         """指定时间只接受过去三天内的正确日期格式。"""
         valid = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")

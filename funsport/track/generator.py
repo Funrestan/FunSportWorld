@@ -4,6 +4,7 @@ import math
 from .geom import (round_to, Rng, make_point_ring, ring_point_at, to_bd,
                    MET_PER_DEG_LAT, MET_PER_DEG_LNG, fmt_gain_time,
                    SPEED_FLOOR, SPEED_CEIL)
+from .pace import apply_location_paces
 from ..logger import log, ok, dim
 
 
@@ -177,19 +178,14 @@ def build(dist, dur, seed, start_ms, points_bd,
 
         if typ == -1:
             avg_sp = round_to(dist_acc / max(1, t_acc), 4)
-            gps = round_to(rng.uniform(15, 46) if rng.random() < 0.12
-                           else rng.uniform(0.5, 6.0), 4)
         else:
             avg_sp = round_to(d_step / dt, 4) if dt > 0 else 0.0
-            kmh = avg_sp * 3.6
-            sigma = max(kmh * 0.08, 0.05)
-            gps = 0.0 if rng.random() < 0.20 else round_to(max(0, kmh + rng.gauss(0, sigma)), 4)
 
         locs.append({
             "id": i + 1, "flag": start_ms,
             "lat": -1.0, "lng": -1.0,
             "gLat": round_to(lat, 7), "gLng": round_to(lng, 7),
-            "speed": round_to(gps, 4), "avgSpeed": avg_sp,
+            "speed": 0.0, "avgSpeed": 0.0,
             "radius": round_to(rng.uniform(1.4, 5.1) if typ == 3 else rng.uniform(1.4, 2.4), 2),
             "accuracy": round_to(rng.uniform(1.4, 2.4), 2),
             "type": typ, "locType": lt,
@@ -274,6 +270,7 @@ def build(dist, dur, seed, start_ms, points_bd,
         locs.insert(0, start_point)
         for index, point in enumerate(locs, 1):
             point["id"] = index
+    apply_location_paces(locs)
     track = {
         "totalTime": total_t_actual,
         "totalDistance": round_to(total_dis_actual, 3),

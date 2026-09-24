@@ -2,3 +2,4 @@ pycryptodome>=3.19
 requests>=2.31
 Pillow>=10.0
 numpy>=1.24
+tkintermapview>=1.28

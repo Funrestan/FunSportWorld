@@ -399,8 +399,15 @@ class App:
             row=7, column=1, sticky="w", pady=6)
         self.entry(form, 8, "最短提前 / 分钟", self.settings_vars, "start_before_min", "30")
         self.entry(form, 9, "最长提前 / 分钟", self.settings_vars, "start_before_max", "300")
+        self.settings_vars["diagnostic_capture"] = tk.BooleanVar(value=False)
+        diagnostic_check = ttk.Checkbutton(
+            form, text="保存跑步通信消息汇总（开发用，一般用户不用开启）",
+            variable=self.settings_vars["diagnostic_capture"])
+        diagnostic_check.grid(row=10, column=1, sticky="w", pady=6)
+        self.add_tooltip(diagnostic_check,
+                         "记录在线预览、提交、OBS 和详情查询的请求与响应；包含精确位置，仅保存在本地，不额外发送逐点事件。")
         bar = ttk.Frame(form)
-        bar.grid(row=10, column=0, columnspan=2, sticky="w", pady=14)
+        bar.grid(row=11, column=0, columnspan=2, sticky="w", pady=14)
         self.button(bar, "保存设置", self.save_settings, True).pack(side="left")
         self.button(bar, "登录", self.login).pack(side="left", padx=10)
         self.button(bar, "退出登录", self.logout).pack(side="left")
@@ -755,6 +762,7 @@ class App:
         except ValueError as exc:
             self.show_error(str(exc))
             return
+        params["diagnostic_capture"] = bool(self.settings_vars["diagnostic_capture"].get())
         self.invalidate_plan()
         self.start_job("生成在线方案预览",
                        lambda: services.with_client(lambda client: prepare_run_plan(client, **params)),
@@ -770,6 +778,7 @@ class App:
         except ValueError as exc:
             self.show_error(str(exc))
             return
+        params["diagnostic_capture"] = bool(self.settings_vars["diagnostic_capture"].get())
         local_params = {key: value for key, value in params.items()
                         if key in ("dist", "pace", "cadence", "start_ms", "before", "seed")}
         self.invalidate_plan()
@@ -811,6 +820,8 @@ class App:
         except ValueError as exc:
             self.show_error(str(exc))
             return
+        diagnostic_capture = bool(self.settings_vars["diagnostic_capture"].get())
+        params["diagnostic_capture"] = diagnostic_capture
         outside = bool(params.pop("allow_outside_window", False))
         if params != self.preview_parameters:
             self.invalidate_plan()
@@ -825,11 +836,14 @@ class App:
             self.show_error("方案不符合本地时段检查。测试开关只能跳过本地检查，不能改变服务器限制。")
             return
         notice = "\n已跳过本地时间检查；服务器限制仍生效，可能返回 11016。" if outside else ""
+        if diagnostic_capture:
+            notice += "\n本次会保存通信记录及精确路线/点位到本地诊断包。"
         if not messagebox.askyesno("确认提交方案", format_plan(plan) + notice +
                                    "\n\n将提交当前预览数据，不能在这里撤销。继续？", parent=self.root):
             return
         self.start_job("提交方案 " + plan.plan_id,
-                       lambda: services.with_client(lambda client: submit_run_plan(client, plan, outside)),
+                       lambda: services.with_client(lambda client: submit_run_plan(
+                           client, plan, outside, diagnostic_capture=diagnostic_capture)),
                        self.run_done)
 
     def run_done(self, result):
@@ -841,6 +855,8 @@ class App:
             summary += "\n" + format_report(report)
         else:
             summary += "\n打卡点显示未验证。"
+        if result.get("diagnostic_dir"):
+            summary += "\n诊断数据：{}".format(result["diagnostic_dir"])
         self.set_report(summary)
         self.tabs.select(self.record_page)
         self.append_log("提交阶段已结束，请查看记录与诊断；勿因显示缺失重复提交。")
