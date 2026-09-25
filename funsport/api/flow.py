@@ -237,6 +237,7 @@ def _prepare_run_plan_impl(client, dist=0, pace=0, cadence=0, start_ms=0,
 
     step("[1/6] 拉取跑步策略…")
     pol = api_policy.fetch_policy(client)
+    policy_received_at = int(time.time() * 1000)
     sel_dist = pol.min_distance
     ok(f"[policy] ts={pol.timestamp} 学校要求 {sel_dist}m")
 
@@ -303,6 +304,9 @@ def _prepare_run_plan_impl(client, dist=0, pace=0, cadence=0, start_ms=0,
         "checkpoint_order": checkpoint_order,
         "checkpoint_evaluation": checkpoint_evaluation,
         "run_rules": run_rules, "completion": completion,
+        "freeze_run_time": pol.freeze_run_time,
+        "freeze_checked_at": policy_received_at,
+        "policy_message": pol.message,
     })
     ok("方案 {} 已生成，尚未提交；{}".format(plan.plan_id, reason))
     return plan
@@ -348,6 +352,14 @@ def submit_run_plan(client, plan, allow_outside_window=None, diagnostic_capture=
     """提交已预览的同一快照；不再次随机生成、重查点位或重建路线。"""
     plan.validate(client)
     data = plan.data()
+    try:
+        freeze_seconds = max(0, int(data.get("freeze_run_time", 0) or 0))
+    except (TypeError, ValueError):
+        freeze_seconds = 0
+    if freeze_seconds > 0:
+        remaining = _remaining_freeze_seconds(data)
+        raise ValueError("方案生成时服务器报告跑步冻结，剩余 {}；服务端禁止提交。请解冻后重新获取策略并生成方案".format(
+            _format_duration(remaining)))
     track, pts = data["track"], data["points"]
     expected_completion = evaluate_completion(
         track, pts, data["policy"], data["min_distance"], data.get("run_rules"))
@@ -481,3 +493,25 @@ def _submit_claimed_plan(client, plan_id, data, diagnostics=None):
 def run_full_flow(client, *args, **kwargs):
     """保留 CLI 一步执行入口，内部共用 GUI 的生成与提交阶段。"""
     return submit_run_plan(client, prepare_run_plan(client, *args, **kwargs))
+
+
+def _remaining_freeze_seconds(data, now_ms=None):
+    """Return the server-reported freeze countdown remaining in a plan snapshot."""
+    try:
+        seconds = max(0, int(data.get("freeze_run_time", 0) or 0))
+        checked = int(data.get("freeze_checked_at", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    if seconds <= 0:
+        return 0
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    elapsed = max(0, (now_ms - checked) // 1000) if checked > 0 else 0
+    return max(0, seconds - elapsed)
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    return "{}天{:02d}:{:02d}:{:02d}".format(days, hours, minutes, secs) if days else "{:02d}:{:02d}:{:02d}".format(hours, minutes, secs)

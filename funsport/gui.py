@@ -2,6 +2,7 @@
 import logging
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
@@ -26,6 +27,7 @@ def configure_theme(root):
     style.configure("TFrame", background="#f5f7fa")
     style.configure("TLabel", background="#f5f7fa")
     style.configure("Muted.TLabel", foreground="#667383")
+    style.configure("Warning.TLabel", foreground="#b42318")
     style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
     style.configure("Heading.TLabel", font=("Microsoft YaHei UI", 18, "bold"))
     style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 17, "bold"), foreground="#1975ba")
@@ -143,6 +145,8 @@ class App:
         self.buttons = []
         self.points = []
         self.plan = None
+        self.freeze_refresh_required = False
+        self.freeze_after_id = None
         self.preview_parameters = None
         self.preview_track = None
         # tkintermapview 元素引用
@@ -268,9 +272,13 @@ class App:
         self.add_tooltip(route_preview, "使用缓存点位和高德路线；不访问运动服务，不可提交")
         self.submit_button = self.button(actions, "提交此方案", self.submit_run)
         self.submit_button.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.freeze_status = tk.StringVar(value="尚未获取在线策略，封禁状态未知")
+        self.freeze_status_label = ttk.Label(
+            form, textvariable=self.freeze_status, wraplength=305, style="Muted.TLabel")
+        self.freeze_status_label.grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.plan_status = tk.StringVar(value="尚未生成方案")
         ttk.Label(form, textvariable=self.plan_status, wraplength=305).grid(
-            row=12, column=0, columnspan=2, sticky="w", pady=4)
+            row=13, column=0, columnspan=2, sticky="w", pady=4)
 
         self.preview_tabs = ttk.Notebook(self.run_page)
         self.preview_tabs.grid(row=0, column=1, sticky="nsew")
@@ -740,6 +748,10 @@ class App:
     def invalidate_plan(self, *args):
         had_plan = self.plan is not None
         self.plan = None
+        self.freeze_refresh_required = False
+        self._cancel_freeze_countdown()
+        self.freeze_status.set("方案已失效；请重新生成在线预览以读取封禁状态")
+        self.freeze_status_label.configure(style="Muted.TLabel")
         self.preview_parameters = None
         self.preview_track = None
         for key, var in self.metrics.items():
@@ -752,8 +764,87 @@ class App:
 
     def refresh_submit_state(self):
         ready = (self.plan is not None and not self.plan.attempted and not self.busy
-                 and not self.plan.data().get("preview_only"))
+                 and not self.plan.data().get("preview_only")
+                 and not self.freeze_refresh_required
+                 and self._remaining_freeze_seconds(self.plan.data()) <= 0)
         self.submit_button.configure(state="normal" if ready else "disabled")
+
+    @staticmethod
+    def _remaining_freeze_seconds(data):
+        """Return the policy freeze countdown remaining in a frozen plan."""
+        try:
+            seconds = max(0, int(data.get("freeze_run_time", 0) or 0))
+            checked_at = int(data.get("freeze_checked_at", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        if seconds <= 0:
+            return 0
+        elapsed = max(0, int(time.time() * 1000 - checked_at) // 1000) if checked_at else 0
+        return max(0, seconds - elapsed)
+
+    @staticmethod
+    def _format_freeze_duration(seconds):
+        seconds = max(0, int(seconds))
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts = []
+        if days:
+            parts.append("{} 天".format(days))
+        if hours or days:
+            parts.append("{} 小时".format(hours))
+        if minutes or hours or days:
+            parts.append("{} 分".format(minutes))
+        parts.append("{} 秒".format(seconds))
+        return " ".join(parts)
+
+    def _cancel_freeze_countdown(self):
+        if self.freeze_after_id is not None:
+            try:
+                self.root.after_cancel(self.freeze_after_id)
+            except tk.TclError:
+                pass
+            self.freeze_after_id = None
+
+    def update_freeze_status(self):
+        """Show the server's freeze countdown and keep stale frozen plans blocked."""
+        self._cancel_freeze_countdown()
+        plan = self.plan
+        if plan is None:
+            return
+        data = plan.data()
+        if data.get("preview_only"):
+            self.freeze_status.set("轨迹预览未查询在线策略，封禁状态未知")
+            self.freeze_status_label.configure(style="Muted.TLabel")
+            return
+        seconds = self._remaining_freeze_seconds(data)
+        try:
+            originally_frozen = int(data.get("freeze_run_time", 0) or 0) > 0
+        except (TypeError, ValueError):
+            originally_frozen = False
+        if seconds > 0:
+            self.freeze_refresh_required = True
+            try:
+                checked_at = int(data.get("freeze_checked_at", 0) or 0)
+                freeze_total = max(0, int(data.get("freeze_run_time", 0) or 0))
+            except (TypeError, ValueError):
+                checked_at, freeze_total = 0, 0
+            unlock_at = checked_at + freeze_total * 1000 if checked_at and freeze_total else 0
+            unlock_text = (datetime.fromtimestamp(unlock_at / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                           if unlock_at else "未知")
+            self.freeze_status.set("跑步已被服务器冻结，剩余 {}；预计解禁 {}；当前方案禁止提交。".format(
+                self._format_freeze_duration(seconds), unlock_text))
+            self.freeze_status_label.configure(style="Warning.TLabel")
+            self.freeze_after_id = self.root.after(1000, self.update_freeze_status)
+        elif originally_frozen:
+            self.freeze_refresh_required = True
+            self.freeze_status.set("服务器冻结倒计时已结束；请重新生成在线预览确认状态后再提交。")
+            self.freeze_status_label.configure(style="Warning.TLabel")
+        else:
+            self.freeze_refresh_required = False
+            self.freeze_status.set("服务器未报告跑步冻结")
+            self.freeze_status_label.configure(style="Muted.TLabel")
+        self.refresh_submit_state()
 
     def generate_preview(self):
         from .api.flow import prepare_run_plan
@@ -789,6 +880,7 @@ class App:
     def show_plan(self, plan, parameters):
         data = plan.data()
         self.plan = plan
+        self.freeze_refresh_required = False
         self.preview_parameters = dict(parameters)
         self.preview_parameters.pop("allow_outside_window", None)
         self.preview_track = data["track"]
@@ -806,6 +898,7 @@ class App:
                         "有效时段内" if data["window_ok"] else "有效时段外")
         self.plan_status.set("方案 {}\n{:.0f} m / {} s / {}".format(plan.plan_id, data["track"]["totalDistance"],
             data["track"]["totalTime"], window_label))
+        self.update_freeze_status()
         self.preview_tabs.select(0)
         self.fit_map()
         self.refresh_submit_state()
@@ -831,6 +924,10 @@ class App:
         data = plan.data()
         if data.get("preview_only"):
             self.show_error("轨迹预览没有学校策略，不允许提交。请在开放时段重新生成在线方案。")
+            return
+        if self.freeze_refresh_required or self._remaining_freeze_seconds(data) > 0:
+            self.update_freeze_status()
+            self.show_error("服务器策略显示跑步处于冻结状态，当前方案不能提交。冻结结束后请重新生成在线预览确认状态。")
             return
         if not data["window_ok"] and not outside:
             self.show_error("方案不符合本地时段检查。测试开关只能跳过本地检查，不能改变服务器限制。")
@@ -943,6 +1040,7 @@ class App:
             messagebox.showinfo("任务正在运行", "请等待当前任务结束后关闭，避免无法确认提交结果。", parent=self.root)
             return
         self.root.after_cancel(self.poll_id)
+        self._cancel_freeze_countdown()
         if self.map_widget is not None:
             try:
                 self.map_widget.destroy()

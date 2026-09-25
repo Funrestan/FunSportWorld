@@ -15,7 +15,8 @@ POLICY_PATH = "/api/v70103/runModePolicy"
 
 class PolicyInfo:
     def __init__(self, timestamp, policy, min_distance, valid_time,
-                 run_rules=None, geo_fence=None, run_area_models=None):
+                 run_rules=None, geo_fence=None, run_area_models=None,
+                 freeze_run_time=0, message=""):
         self.timestamp = timestamp
         self.policy = policy
         self.min_distance = min_distance
@@ -24,6 +25,12 @@ class PolicyInfo:
         self.run_rules = deepcopy(run_rules) if run_rules is not None else {}
         self.geo_fence = deepcopy(geo_fence)
         self.run_area_models = deepcopy(run_area_models)
+        # App uses this server value as the remaining frozen duration, in seconds.
+        try:
+            self.freeze_run_time = max(0, int(freeze_run_time or 0))
+        except (TypeError, ValueError):
+            self.freeze_run_time = 0
+        self.message = str(message or "")
 
 
 def fetch_policy(client):
@@ -65,6 +72,14 @@ def fetch_policy(client):
             if isinstance(w, dict) and w.get("start") and w.get("end")
         ]
 
+    raw_data = biz.get("data") if isinstance(biz, dict) else None
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data)
+        except (TypeError, ValueError):
+            raw_data = None
+    policy_message = raw_data.get("message", "") if isinstance(raw_data, dict) else ""
+
     p = PolicyInfo(
         timestamp=ts,
         policy=policy,
@@ -73,7 +88,9 @@ def fetch_policy(client):
         run_rules=rule,
         geo_fence=get_field(biz, "geoFence"),
         run_area_models=get_field(biz, "runAreaModels"),
+        freeze_run_time=get_field(biz, "freezeRunTime") or 0,
+        message=policy_message,
     )
     ok(f"[policy] ts={p.timestamp} policy={p.policy} minDist={p.min_distance} "
-       f"validTime={vt}")
+       f"validTime={vt} freeze={p.freeze_run_time}s")
     return p
