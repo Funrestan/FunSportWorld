@@ -838,8 +838,18 @@ class App:
         notice = "\n已跳过本地时间检查；服务器限制仍生效，可能返回 11016。" if outside else ""
         if diagnostic_capture:
             notice += "\n本次会保存通信记录及精确路线/点位到本地诊断包。"
-        if not messagebox.askyesno("确认提交方案", format_plan(plan) + notice +
-                                   "\n\n将提交当前预览数据，不能在这里撤销。继续？", parent=self.root):
+        completion = data.get("completion") or {}
+        if completion.get("complete") is True:
+            run_state = "本地判定为满足"
+        elif completion.get("complete") is False:
+            run_state = "本地判定为未满足（{}）".format(
+                completion.get("unCompleteReason", "未知原因"))
+        else:
+            run_state = "本地判定未知"
+        confirm_text = ("当前跑步状态为：{}。\n\n{}{}"
+                        "\n\n将提交当前预览数据，不能在这里撤销。继续？").format(
+                            run_state, format_plan(plan), notice)
+        if not messagebox.askyesno("确认提交方案", confirm_text, parent=self.root):
             return
         self.start_job("提交方案 " + plan.plan_id,
                        lambda: services.with_client(lambda client: submit_run_plan(

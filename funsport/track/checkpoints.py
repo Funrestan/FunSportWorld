@@ -1,4 +1,4 @@
-"""Replay the recovered sequential checkpoint rules on generated locations."""
+"""Replay the recovered checkpoint rules on generated locations."""
 import copy
 import json
 import math
@@ -82,9 +82,13 @@ def evaluate_checkpoints(track, points, policy, metadata=None, geo_fence=None, r
     invalid; other generated samples are inputs to this explicitly local model.
     """
     result_track, result_points = copy.deepcopy(track), copy.deepcopy(points)
+    supported = type(policy) is int and policy in (0, 1)
+    mode = ("sequence" if type(policy) is int and policy == 1
+            else "random" if type(policy) is int and policy == 0
+            else "unsupported")
     report = {
-        "version": 1, "mode": "sequence" if type(policy) is int and policy == 1 else "unsupported",
-        "supported": type(policy) is int and policy == 1,
+        "version": 1, "mode": mode,
+        "supported": supported,
         "native_validity_verified": False, "server_verified": False,
         "assumptions": ["native_filter_not_reproduced", "generated_sample_types_used_for_validity"],
         "radius_m": PASS_RADIUS_M, "events": [], "samples": [],
@@ -94,8 +98,10 @@ def evaluate_checkpoints(track, points, policy, metadata=None, geo_fence=None, r
         report.update({"all_passed": None, "passed_count": sum(p.get("isPass") is True for p in points)})
         return result_track, result_points, report
     positions = [p.get("position") for p in result_points]
-    if (not 1 <= len(positions) <= 5 or any(type(p) is not int for p in positions)
-            or positions != list(range(len(positions)))):
+    if not 1 <= len(positions) <= 5:
+        raise ValueError("Checkpoint evaluation requires 1 to 5 points")
+    if policy == 1 and (any(type(p) is not int for p in positions)
+                        or positions != list(range(len(positions)))):
         raise ValueError("Sequential checkpoint evaluation requires ordered positions 0..N-1")
     # Generated plans are new runs, so cached states cannot count as arrivals.
     for point in result_points:
@@ -113,7 +119,8 @@ def evaluate_checkpoints(track, points, policy, metadata=None, geo_fence=None, r
     for index, sample in enumerate(result_track["locations"]):
         elapsed = sample.get("totalTime")
         entry = {"sample_index": index, "elapsed_seconds": elapsed,
-                 "target_position": pending[0] if pending else None,
+                 "target_position": pending[0] if policy == 1 and pending else None,
+                 "pending_positions": list(pending),
                  "original_type": sample.get("type")}
         report["samples"].append(entry)
         reason = None
@@ -153,24 +160,68 @@ def evaluate_checkpoints(track, points, policy, metadata=None, geo_fence=None, r
                     elif pace < 2.0:
                         reason = "pace_below_two"
                     else:
-                        target_index = pending[0]
-                        distance = distance_m(current, targets[target_index])
+                        # The official random plugin scans unpassed points and
+                        # stops after the first hit.  A sample therefore can
+                        # advance at most one point even when targets overlap.
+                        candidate_distances = [
+                            (target_index, distance_m(current, targets[target_index]))
+                            for target_index in pending
+                        ]
+                        if policy == 1:
+                            target_index, distance = candidate_distances[0]
+                            matching = distance <= PASS_RADIUS_M
+                        else:
+                            target_index, distance = next(
+                                ((target_index, distance)
+                                 for target_index, distance in candidate_distances
+                                 if distance <= PASS_RADIUS_M),
+                                (None, min(distance for _, distance in candidate_distances)),
+                            )
+                            matching = target_index is not None
                         entry["distance_m"] = round(distance, 6)
-                        if distance <= PASS_RADIUS_M:
+                        if policy == 0:
+                            entry["candidate_distances_m"] = {
+                                str(index): round(value, 6)
+                                for index, value in candidate_distances
+                            }
+                        if matching:
                             result_points[target_index]["isPass"] = True
                             if not recovery:
-                                sample["type"] = 2
+                                # RunRandomPImpl returns type=2 for the fixed
+                                # assessment point and type=1 for ordinary
+                                # random points; sequence mode uses type=2 for
+                                # each reached checkpoint.
+                                sample["type"] = (
+                                    2 if policy == 1 or result_points[target_index].get("isFixed") == 1
+                                    else 1)
                             event = {**entry, "point_id": result_points[target_index].get("id"),
-                                     "position": target_index, "stored_type": sample["type"],
-                                     "isPass": True}
+                                 "position": target_index, "stored_type": sample["type"],
+                                 "point_position": result_points[target_index].get("position"),
+                                 "isFixed": result_points[target_index].get("isFixed", 0),
+                                 "isPass": True}
                             report["events"].append(event)
-                            pending.pop(0)
+                            pending.remove(target_index)
                             reason = "passed"
                         else:
                             reason = "outside_target_radius"
         entry["decision"] = reason
         if reason != "passed":
             skipped[reason] += 1
-    report.update({"all_passed": not pending, "passed_count": len(result_points) - len(pending),
-                   "pending_positions": pending, "skipped_counts": dict(skipped)})
+    passed_indices = [index for index, point in enumerate(result_points)
+                      if point.get("isPass") is True]
+    fixed_indices = [index for index in passed_indices
+                     if result_points[index].get("isFixed") == 1]
+    ordinary_indices = [index for index in passed_indices
+                        if result_points[index].get("isFixed") != 1]
+    report.update({
+        "all_passed": not pending,
+        "passed_count": len(passed_indices),
+        "fixed_passed_count": len(fixed_indices),
+        "ordinary_passed_count": len(ordinary_indices),
+        "passed_positions": passed_indices,
+        "pending_positions": pending,
+        "fixed_positions": fixed_indices,
+        "ordinary_positions": ordinary_indices,
+        "skipped_counts": dict(skipped),
+    })
     return result_track, result_points, report
